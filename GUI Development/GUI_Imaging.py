@@ -52,8 +52,12 @@ folder_picker = FileDialog(
     allow_drag=False
 )
 
+# Create texture registry with the persistent dynamic texture
 with dpg.texture_registry(show=False):
-    dpg.add_dynamic_texture(1024, 1024, [1.0] * (1024 * 1024 * 4), tag="dynamic_texture")
+    import numpy as np
+    _placeholder = np.zeros((2048, 2048, 4), dtype=np.float32).flatten().tolist()
+    dpg.add_dynamic_texture(2048, 2048, _placeholder, tag="dynamic_texture")
+
 dpg.create_viewport(title='GUI', width=1430, height=1120)
 
 with dpg.window(tag="left_window", label="Controls", pos=(10, 10), width=330, height=200, no_move=True):

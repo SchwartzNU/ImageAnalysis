@@ -24,15 +24,62 @@ selected_masks = []
 metadata_df = pd.DataFrame(columns=["filename", "z_min", "z_max", "rip_cells", "sex", "eye", "time_min", "djid", "age", "genotype", "treatment"])
 texture_cache = None
 last_show_masks = True
+metadata_df = pd.DataFrame(columns=["filename", "z_min", "z_max", "rip_cells", "sex", "eye", "time_min", "djid", "age", "genotype", "treatment"])
+texture_cache = None
+last_show_masks = True
 last_selected = []
 display_map = {}
 confirmed_rip_masks = {}
 
+# Fixed dynamic texture canvas size (power-of-two friendly)
+_TEXTURE_SIZE = 2048
+
+# Texture is created by GUI_Imaging.py at startup; we just use it
+
 def to_8bit(arr):
     norm = arr.astype(np.float32)
-    if norm.max() > 0:
+    if norm.size and norm.max() > 0:
         norm /= norm.max()
+    else:
+        norm = norm * 0.0
     return img_as_ubyte(norm)
+
+def _set_dynamic_texture_from_array(rgba):
+    """
+    Put `rgba` into the central region of a single fixed-size dynamic texture
+    and update it via `dpg.set_value`. Rescales if image is larger than the canvas.
+    """
+    if rgba is None:
+        return
+    arr = np.asarray(rgba, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        raise ValueError("rgba must be HxWx4")
+
+    h, w = arr.shape[0], arr.shape[1]
+
+    # Downscale if needed to fit in canvas while preserving aspect ratio
+    max_side = _TEXTURE_SIZE
+    scale = min(1.0, max_side / max(h, w))
+    if scale < 1.0:
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        arr_resized = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        arr_resized = arr
+        new_h, new_w = h, w
+
+    # Place resized image centered in canvas
+    canvas = np.zeros((_TEXTURE_SIZE, _TEXTURE_SIZE, 4), dtype=np.float32)
+    y0 = (_TEXTURE_SIZE - new_h) // 2
+    x0 = (_TEXTURE_SIZE - new_w) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w, :] = arr_resized
+
+    # Flatten and update the single texture
+    flat = canvas.flatten().tolist()
+    try:
+        dpg.set_value("dynamic_texture", flat)
+    except Exception as exc:
+        print(f"[WARN] set_value failed: {exc}")
 
 def normalize_image_fixed(img):
     return img.astype(np.float32) / 255.0
@@ -75,7 +122,7 @@ def draw_mask_outlines():
     rgba[..., :3] = (1 - mask_alpha) * rgba[..., :3] + mask_alpha * outline_rgba[..., :3]
     rgba[..., 3] = np.clip(rgba[..., 3] + outline_rgba[..., 3], 0, 1)
 
-    dpg.set_value("dynamic_texture", rgba.flatten().tolist())
+    _set_dynamic_texture_from_array(rgba)
 
 def blend_with_masks(gray):
     h, w = gray.shape
@@ -107,9 +154,6 @@ def refresh_contents_list(sender=None, app_data=None, user_data=None):
         display = f"{tag_string} {f}" if tag_string else f
         display_items.append(display)
         display_map[display] = f
-
-    dpg.configure_item("contents_list", items=display_items)
-
 
     dpg.configure_item("contents_list", items=display_items)
 
@@ -152,7 +196,6 @@ def open_folder_dialog(sender, app_data, user_data):
         if dpg.does_item_exist(tag):
             dpg.hide_item(tag)
     dpg.set_value("status_text", "Folder loaded")
-
 
 def contents_list_callback(sender, app_data, user_data):
     display_name = dpg.get_value("contents_list")
@@ -420,7 +463,7 @@ def update_texture(base_img=None, force=False):
 
     show_masks = dpg.get_value("show_masks_checkbox")
     if not force and texture_cache is not None and show_masks == last_show_masks and selected_masks == last_selected:
-        dpg.set_value("dynamic_texture", texture_cache)
+        _set_dynamic_texture_from_array(np.asarray(texture_cache).reshape((base_img.shape[0], base_img.shape[1], 4)))
         return
 
     print(f"[DEBUG] Image min: {np.min(base_img)}, max: {np.max(base_img)}")
@@ -449,7 +492,7 @@ def update_texture(base_img=None, force=False):
     texture_cache = rgba.flatten().tolist()
     last_show_masks = show_masks
     last_selected = selected_masks.copy()
-    dpg.set_value("dynamic_texture", texture_cache)
+    _set_dynamic_texture_from_array(rgba)
     if selected_masks:
         dpg.set_value("selected_mask_count", f"Cells in rip: {sorted(selected_masks)}")
     else:
@@ -498,9 +541,3 @@ def confirm_mask_selection_callback(sender, app_data, user_data):
         metadata_df.at[metadata_df.index[idx][0], "rip_cells"] = selected_masks.copy()
         dpg.set_value("selected_mask_count", f"Cells in rip: {sorted(selected_masks)}")
         dpg.set_value("status_text", f"Masks confirmed for {opened_file}")
-    
-    refresh_contents_list()
-    for display_name, real_name in display_map.items():
-        if real_name == opened_file:
-            dpg.set_value("contents_list", display_name)
-            break

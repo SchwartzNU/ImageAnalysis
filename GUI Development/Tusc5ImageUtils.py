@@ -6,10 +6,17 @@ import dearpygui.dearpygui as dpg
 from skimage import img_as_ubyte
 import nd2
 from dearpygui_obj.userwidget import UserWidget
+import cv2
 
 # Helper: convert to 8-bit
 def to_8bit(arr):
-    return img_as_ubyte(arr.astype(np.float32) / arr.max())
+    arrf = arr.astype(np.float32)
+    maxv = arrf.max() if arrf.size else 0.0
+    if maxv > 0:
+        norm = arrf / maxv
+    else:
+        norm = arrf * 0.0
+    return img_as_ubyte(norm)
 
 # Max projection helper
 def max_proj(channel_zstack):
@@ -81,6 +88,46 @@ channel_zstack = None
 colors = {}
 selected_masks = []
 
+# Fixed dynamic texture canvas size
+_TEXTURE_SIZE = 2048
+
+def _set_dynamic_texture_from_array(rgba):
+    """
+    Put `rgba` into the central region of a single fixed-size dynamic texture
+    and update it via `dpg.set_value`. Rescales if image is larger than the canvas.
+    """
+    if rgba is None:
+        return
+    arr = np.asarray(rgba, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        raise ValueError("rgba must be HxWx4")
+
+    h, w = arr.shape[0], arr.shape[1]
+
+    # Downscale if needed to fit in canvas while preserving aspect ratio
+    max_side = _TEXTURE_SIZE
+    scale = min(1.0, max_side / max(h, w))
+    if scale < 1.0:
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        arr_resized = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        arr_resized = arr
+        new_h, new_w = h, w
+
+    # Place resized image centered in canvas
+    canvas = np.zeros((_TEXTURE_SIZE, _TEXTURE_SIZE, 4), dtype=np.float32)
+    y0 = (_TEXTURE_SIZE - new_h) // 2
+    x0 = (_TEXTURE_SIZE - new_w) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w, :] = arr_resized
+
+    # Flatten and update the single texture
+    flat = canvas.flatten().tolist()
+    try:
+        dpg.set_value("dynamic_texture", flat)
+    except Exception as exc:
+        print(f"[WARN] set_value failed: {exc}")
+
 # Blend function: masks at 10% alpha, selected masks fully opaque
 def blend_with_masks(gray, masks, colors, selected, alpha=0.1):
     base = gray.astype(np.float32)
@@ -100,8 +147,8 @@ def blend_with_masks(gray, masks, colors, selected, alpha=0.1):
 # Initialize DearPyGui and placeholder texture
 dpg.create_context()
 with dpg.texture_registry(show=False):
-    placeholder = np.ones((1024, 1024, 4), dtype=np.float32).flatten().tolist()
-    dpg.add_dynamic_texture(1024, 1024, placeholder, tag="dynamic_texture")
+    placeholder = np.ones((1, 1, 4), dtype=np.float32).flatten().tolist()
+    dpg.add_dynamic_texture(1, 1, placeholder, tag="dynamic_texture")
 
 # Core callbacks
 def open_folder_dialog(sender, app_data, user_data):
@@ -147,8 +194,8 @@ def open_nd2_callback(sender, app_data, user_data):
     mask_array = np.zeros_like(proj, dtype=int)
     colors.clear(); selected_masks.clear()
     h, w = proj.shape
-    data = blend_with_masks(proj, mask_array, colors, selected_masks).flatten().tolist()
-    dpg.set_value("dynamic_texture", data)
+    data = blend_with_masks(proj, mask_array, colors, selected_masks)
+    _set_dynamic_texture_from_array(data)
     dpg.configure_item("drawlist", width=w, height=h)
     dpg.configure_item("right_window", width=w+20, height=h+200)
     dpg.delete_item("drawlist", children_only=True)
@@ -175,8 +222,8 @@ def mask_click_callback(sender, app_data, user_data):
 
 # Update texture
 def update_texture():
-    data = blend_with_masks(gray_img, mask_array, colors, selected_masks).flatten().tolist()
-    dpg.set_value("dynamic_texture", data)
+    data = blend_with_masks(gray_img, mask_array, colors, selected_masks)
+    _set_dynamic_texture_from_array(data)
 
 # Viewport resize
 def viewport_resize_callback(sender, app_data):
