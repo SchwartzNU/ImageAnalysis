@@ -15,7 +15,7 @@ from GUI_helpers import (
     confirm_mask_selection_callback,
     save_metadata_callback
 )
-from analysis_helpers import extract_traces
+from analysis_helpers import segment_images, extract_traces
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(ROOT_DIR)
@@ -52,11 +52,15 @@ folder_picker = FileDialog(
     allow_drag=False
 )
 
-# Create texture registry with the persistent dynamic texture
+# Create texture registry with persistent dynamic textures
 with dpg.texture_registry(show=False):
     import numpy as np
-    _placeholder = np.zeros((2048, 2048, 4), dtype=np.float32).flatten().tolist()
-    dpg.add_dynamic_texture(2048, 2048, _placeholder, tag="dynamic_texture")
+    # Main image texture: 1024x512
+    _placeholder = np.zeros((512, 1024, 4), dtype=np.float32).flatten().tolist()
+    dpg.add_dynamic_texture(1024, 512, _placeholder, tag="dynamic_texture")
+    # Segmentation texture: match main image size (1024x512) so panels stay locked
+    _placeholder_seg = np.zeros((512, 1024, 4), dtype=np.float32).flatten().tolist()
+    dpg.add_dynamic_texture(1024, 512, _placeholder_seg, tag="segmentation_texture")
 
 dpg.create_viewport(title='GUI', width=1430, height=1120)
 
@@ -78,17 +82,13 @@ with dpg.window(tag="contents_window", label="Folder Contents", pos=(10, 220), w
         with dpg.group(horizontal=True):
             dpg.add_text("DJID:")
             dpg.add_input_text(tag="djid_input", readonly=False, width=37)
-            dpg.add_text("Age (mo):")
-            dpg.add_input_text(tag="age_input", readonly=False, width=25)
-            dpg.add_text("Genotype:")
-            dpg.add_combo(items=["Homo", "Het", "WT", "Unknown"], tag="gen_combo", label="", width=51)
-        with dpg.group(horizontal=True):
-            dpg.add_text("Sex:")
-            dpg.add_combo(items=["M", "F", "Unknown"], tag="sex_combo", label="", width=30)
             dpg.add_text("Eye:")
             dpg.add_combo(items=["L", "R", "Unknown"], tag="eye_combo", label="", width=30)
+            dpg.add_text("Stain:")
+            dpg.add_combo(items=["GLUT1", "GLUT3"], tag="stain_combo", label="", width=50)
+        with dpg.group(horizontal=True):
             dpg.add_text("Treatment:")
-            dpg.add_combo(items=["Experimental", "Control"], tag="treatment_combo", label="", width=88)
+            dpg.add_combo(items=["sutured", "open", "light flicker", "dark"], tag="treatment_combo", label="", width=100)
         with dpg.group(horizontal=True):
             dpg.add_text("Duration (min):")
             dpg.add_input_text(tag="time_input", hint="e.g. 0, 15, 30, 60, 90", width=201)
@@ -113,18 +113,29 @@ with dpg.window(tag="rip_panel", label="Rip Panel", pos=(10, 735), width=330, he
         dpg.add_button(label="Confirm Masks", tag="confirm_masks_button", show=False, callback=confirm_mask_selection_callback)
 
 with dpg.window(tag="analysis_panel", label="Analysis Panel", pos=(10, 870), width=330, height=150):
-    dpg.add_button(label="Extract Traces", tag="extract_traces_button", width=315)
+    dpg.add_text("Step 1: Segmentation", color=(200, 200, 0))
+    dpg.add_button(label="Segment Images", tag="segment_images_button", width=315, callback=segment_images)
+    dpg.add_spacer(height=5)
+    dpg.add_text("Step 2: Extract Traces", color=(200, 200, 0))
+    dpg.add_button(label="Extract Traces", tag="extract_traces_button", width=315, callback=extract_traces)
+    dpg.add_spacer(height=8)
+    with dpg.group(tag="seg_options_group"):
+        dpg.add_text("Segmentation Options", color=(180,180,255))
+        dpg.add_checkbox(label="Show Removed Masks (grey)", tag="show_removed_masks", default_value=True, callback=lambda s,a,u: gh.display_segmentation_filtered())
     dpg.add_text("File: None", tag="trace_file_status", wrap=280)
     dpg.add_text("Status: Waiting", tag="trace_status_text", wrap=280)
-dpg.set_item_callback("extract_traces_button", extract_traces)
 
 
-with dpg.window(tag="right_window", label="Image Panel", pos=(350, 10), width=1040, height=1060):
-    with dpg.drawlist(tag="drawlist", width=1024, height=1024):
-        dpg.draw_image("dynamic_texture", (0, 0), (1024, 1024))
+with dpg.window(tag="right_window", label="Image Panel", pos=(350, 10), width=1070, height=600):
+    with dpg.drawlist(tag="drawlist", width=1024, height=512):
+        dpg.draw_image("dynamic_texture", (0, 0), (1024, 512))
     handler = dpg.add_item_handler_registry()
     dpg.add_item_clicked_handler(callback=mask_click_callback, parent=handler)
     dpg.bind_item_handler_registry("drawlist", handler)
+
+with dpg.window(tag="segmentation_window", label="Segmentation", pos=(350, 620), width=1070, height=540):
+    with dpg.drawlist(tag="segmentation_drawlist", width=1024, height=512):
+        dpg.draw_image("segmentation_texture", (0, 0), (1024, 512))
 
 dpg.setup_dearpygui()
 dpg.show_viewport()

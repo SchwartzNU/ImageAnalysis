@@ -16,6 +16,322 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 trace_data_df = None
 
+def assign_colors_to_masks(mask_array):
+    """
+    Assign colors to masks using graph coloring to maximize visual differences between adjacent cells.
+    Returns: dict mapping mask_id -> (r, g, b) normalized to 0-1 range
+    """
+    from collections import defaultdict
+    
+    unique_masks = np.unique(mask_array)
+    unique_masks = unique_masks[unique_masks > 0]  # Exclude background
+    
+    if len(unique_masks) == 0:
+        return {}
+    
+    # Define a palette of highly distinct colors using proper HSV space
+    palette = []
+    # OpenCV HSV: Hue 0-180, Saturation 0-255, Value 0-255
+    # Generate many distinct colors with different hues, saturations, and values
+    hues = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165]  # 12 hues in 0-180 range (multiply by 180/360)
+    # Define a palette sized to the number of masks (avoid running out of distinct hues)
+    palette = []
+    # OpenCV HSV: Hue 0-180, Saturation 0-255, Value 0-255
+    palette_size = max(72, len(unique_masks))
+    # Evenly spaced hues across 0-179
+    hues = np.linspace(0, 179, palette_size, endpoint=False).astype(int)
+    sat = 255
+    val = 255
+    for hue in hues:
+        hsv_color = np.uint8([[[int(hue), sat, val]]])
+        rgb_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2RGB)
+        r = float(rgb_color[0, 0, 0]) / 255.0
+        g = float(rgb_color[0, 0, 1]) / 255.0
+        b = float(rgb_color[0, 0, 2]) / 255.0
+        palette.append((r, g, b))
+        print(f"[DEBUG] Palette color range check:")
+        rs = [c[0] for c in palette]
+        gs = [c[1] for c in palette]
+        bs = [c[2] for c in palette]
+        print(f"[DEBUG]   R range: {min(rs):.2f} - {max(rs):.2f}")
+        print(f"[DEBUG]   G range: {min(gs):.2f} - {max(gs):.2f}")
+        print(f"[DEBUG]   B range: {min(bs):.2f} - {max(bs):.2f}")
+    
+    # Build adjacency graph - masks are adjacent if they touch
+    adjacencies = defaultdict(set)
+    for mask_id in unique_masks:
+        mask = (mask_array == mask_id).astype(np.uint8)
+        # Dilate slightly to find neighbors
+        dilated = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+        # Find which masks overlap with dilated region
+        for other_id in unique_masks:
+            if other_id != mask_id:
+                other_mask = (mask_array == other_id).astype(np.uint8)
+                if np.any(dilated & other_mask):  # Both are uint8, bitwise AND works
+                    adjacencies[mask_id].add(other_id)
+    
+    # Improved greedy assignment: prefer palette colors that maximize color-distance
+    # to already-assigned neighboring colors so we use many distinct colors while
+    # still avoiding exact adjacency matches.
+    color_assignment = {}
+    sorted_masks = sorted(unique_masks, key=lambda x: -len(adjacencies[x]))
+
+    def color_distance(c1, c2):
+        return (c1[0]-c2[0])**2 + (c1[1]-c2[1])**2 + (c1[2]-c2[2])**2
+
+    for mask_id in sorted_masks:
+        # Colors already used by adjacent masks
+        adjacent_colors = [color_assignment[adj] for adj in adjacencies[mask_id] if adj in color_assignment]
+
+        best_color = None
+        best_score = -1.0
+
+        # Evaluate each candidate in palette and pick the one maximizing the
+        # minimal distance to adjacent colors (so it's as different as possible)
+        for color in palette:
+            if color in adjacent_colors:
+                continue
+            if not adjacent_colors:
+                # No assigned neighbors yet -> prefer colors that are not yet used globally
+                # Score by inverse of how many times color already used
+                used_count = sum(1 for v in color_assignment.values() if v == color)
+                score = 1.0 / (1 + used_count)
+            else:
+                # Score is the minimal squared distance to neighbors
+                dists = [color_distance(color, ac) for ac in adjacent_colors]
+                score = min(dists) if dists else 0.0
+
+            if score > best_score:
+                best_score = score
+                best_color = color
+
+        if best_color is None:
+            # Fallback: pick a palette color with minimal global usage
+            counts = {c: sum(1 for v in color_assignment.values() if v == c) for c in palette}
+            best_color = min(counts.keys(), key=lambda c: counts[c])
+
+        color_assignment[mask_id] = best_color
+
+    # Debug: Check what colors got assigned
+    if len(color_assignment) > 0:
+        assigned_colors = set(color_assignment.values())
+        print(f"[DEBUG] Color assignment: {len(color_assignment)} masks, {len(assigned_colors)} unique colors")
+        if len(assigned_colors) > 1:
+            colors_list = list(assigned_colors)[:5]
+            print(f"[DEBUG] Sample assigned colors: {colors_list}")
+
+    return color_assignment
+
+def save_segmentation_visualization(mask_array, color_assignment, output_path):
+    """
+    Save segmentation visualization with labels as a multi-page TIFF stack.
+    """
+    seg_viz = create_labeled_segmentation_image(mask_array, color_assignment)
+    # Convert from RGBA float32 to RGB uint8 for saving
+    rgb_uint8 = (seg_viz[..., :3] * 255).astype(np.uint8)
+    # Convert RGB to BGR for OpenCV
+    bgr_uint8 = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(output_path, bgr_uint8)
+    print(f"Saved segmentation visualization to: {output_path}")
+
+def create_filtered_segmentation_visualization(mask_array, color_assignment, filtered_idxs, output_path=None):
+    """
+    Create segmentation visualization where removed cells are transparent/hidden.
+    filtered_idxs: list of mask IDs that passed filtering (1-indexed in mask_array)
+    output_path: optional path to save PNG. If None, only returns RGBA array.
+    Returns: RGBA image as numpy array
+    """
+    h, w = mask_array.shape
+    rgba = np.zeros((h, w, 4), dtype=np.float32)
+    
+    unique_masks = np.unique(mask_array)
+    unique_masks = unique_masks[unique_masks > 0]
+    
+    # Draw only filtered masks (removed cells stay transparent)
+    for mask_id in unique_masks:
+        if (mask_id - 1) not in filtered_idxs:
+            continue  # Skip removed cells
+            
+        mask = (mask_array == mask_id)
+        if mask_id in color_assignment:
+            r, g, b = color_assignment[mask_id]
+            rgba[mask, 0] = r
+            rgba[mask, 1] = g
+            rgba[mask, 2] = b
+            rgba[mask, 3] = 1.0  # Fully opaque
+    
+    # Add labels for filtered cells only
+    for mask_id in unique_masks:
+        if (mask_id - 1) not in filtered_idxs:
+            continue  # Skip removed cells
+            
+        mask = (mask_array == mask_id).astype(np.uint8)
+        
+        # Find centroid for label
+        props = cv2.moments(mask)
+        if props['m00'] != 0:
+            cx = int(props['m10'] / props['m00'])
+            cy = int(props['m01'] / props['m00'])
+            
+            # Get background color
+            if mask_id in color_assignment:
+                r, g, b = color_assignment[mask_id]
+            else:
+                r, g, b = 0.5, 0.5, 0.5
+            
+            # Determine text color based on background brightness
+            brightness = 0.299 * r + 0.587 * g + 0.114 * b
+            text_color = (1.0, 1.0, 1.0) if brightness < 0.5 else (0.0, 0.0, 0.0)
+            text_color_bgr = (int(text_color[2] * 255), int(text_color[1] * 255), int(text_color[0] * 255))
+            
+            # Create label text
+            label_text = str(int(mask_id))
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            thickness = 2
+            
+            # Get text size
+            text_size, _ = cv2.getTextSize(label_text, font, font_scale, thickness)
+            text_w, text_h = text_size
+            
+            # Draw text
+            x = max(0, min(cx - text_w // 2, w - text_w))
+            y = max(text_h, min(cy + text_h // 2, h))
+            
+            text_img = np.zeros((h, w, 3), dtype=np.uint8)
+            cv2.putText(text_img, label_text, (x, y), font, font_scale, text_color_bgr, thickness)
+            
+            # Blend text into RGBA
+            text_mask = np.any(text_img != 0, axis=2)
+            rgba[text_mask, 0] = text_color[0]
+            rgba[text_mask, 1] = text_color[1]
+            rgba[text_mask, 2] = text_color[2]
+            rgba[text_mask, 3] = 1.0
+    
+    # Save as PNG if output_path provided
+    if output_path:
+        rgb_uint8 = (rgba[..., :3] * 255).astype(np.uint8)
+        bgr_uint8 = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(output_path, bgr_uint8)
+        print(f"Saved filtered segmentation visualization to: {output_path}")
+    
+    return rgba
+
+def create_labeled_segmentation_image(mask_array, color_assignment, filtered_idxs=None, label_min_area=5, force_labels=False, show_removed=False):
+    """
+    Create a segmentation visualization with colored, filled masks and numeric labels.
+    Text color is chosen (black or white) based on background brightness.
+    Returns: RGBA image as numpy array
+    """
+    h, w = mask_array.shape
+    print(f"[DEBUG] create_labeled_segmentation_image: {len(color_assignment)} colors, mask shape {h}x{w}")
+    # Print sample colors
+    if color_assignment:
+        sample_ids = list(color_assignment.keys())[:3]
+        print(f"[DEBUG] Sample color assignments: {[(mid, color_assignment[mid]) for mid in sample_ids]}")
+    rgba = np.zeros((h, w, 4), dtype=np.float32)
+    
+    unique_masks = np.unique(mask_array)
+    unique_masks = unique_masks[unique_masks > 0]
+
+        # Draw filled colored masks. If filtered_idxs is provided and show_removed is True, render removed masks in semi-transparent gray.
+    for mask_id in unique_masks:
+        mask = (mask_array == mask_id)
+        kept = True
+        if filtered_idxs is not None:
+            # filtered_idxs stores zero-based indices of masks that were kept
+            kept = ((mask_id - 1) in filtered_idxs)
+
+        if kept:
+            if mask_id in color_assignment:
+                r, g, b = color_assignment[mask_id]
+            else:
+                r, g, b = 0.5, 0.5, 0.5
+            rgba[mask, 0] = r
+            rgba[mask, 1] = g
+            rgba[mask, 2] = b
+            rgba[mask, 3] = 1.0  # Fully opaque
+        else:
+            if show_removed:
+                # draw removed as semi-transparent gray
+                rgba[mask, 0] = 0.25
+                rgba[mask, 1] = 0.25
+                rgba[mask, 2] = 0.25
+                rgba[mask, 3] = 0.35
+    
+    # Add labels with dynamic text color. Use regionprops centroid as a robust
+    # fallback and skip extremely small regions unless force_labels is True.
+    from skimage.measure import regionprops
+    for mask_id in unique_masks:
+        mask_bool = (mask_array == mask_id)
+        mask = mask_bool.astype(np.uint8)
+
+        # Use regionprops for robust measurements
+        props = regionprops(mask)
+        if not props:
+            continue
+        prop = props[0]
+        area = prop.area
+        # Skip labeling very small regions unless forced
+        if (not force_labels) and area < label_min_area:
+            continue
+
+        # Centroid (row, col)
+        cyf, cxf = prop.centroid
+        cx = int(round(cxf))
+        cy = int(round(cyf))
+
+        # Get background color for this mask
+        if mask_id in color_assignment:
+            r, g, b = color_assignment[mask_id]
+        else:
+            r, g, b = 0.5, 0.5, 0.5
+
+        # Determine text color based on background brightness
+        brightness = 0.299 * r + 0.587 * g + 0.114 * b
+        text_color = (1.0, 1.0, 1.0) if brightness < 0.5 else (0.0, 0.0, 0.0)
+        text_color_bgr = (int(text_color[2] * 255), int(text_color[1] * 255), int(text_color[0] * 255))
+
+        # Create label text
+        label_text = str(int(mask_id))
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        # Scale font with area so larger masks get larger text
+        font_scale = 0.5 if area < 200 else 0.8
+        thickness = 2 if area >= 200 else 1
+
+        # Determine bounding box for this region and adapt font to fit within it
+        minr, minc, maxr, maxc = prop.bbox
+        bbox_w = max(1, maxc - minc)
+        bbox_h = max(1, maxr - minr)
+
+        # Start with base font scale and reduce until it fits within the bbox width
+        text_size, _ = cv2.getTextSize(label_text, font, font_scale, thickness)
+        text_w, text_h = text_size
+        max_text_w = max(1, bbox_w - 4)
+        while text_w > max_text_w and font_scale > 0.2:
+            font_scale -= 0.1
+            text_size, _ = cv2.getTextSize(label_text, font, font_scale, thickness)
+            text_w, text_h = text_size
+
+        # Place text centered in the region's bbox and clamp to image bounds
+        cx_clamped = int(min(max(cx, minc + text_w // 2), maxc - text_w // 2))
+        cy_clamped = int(min(max(cy, minr + text_h // 2), maxr - text_h // 2))
+        x = max(0, min(cx_clamped - text_w // 2, w - text_w))
+        y = max(text_h, min(cy_clamped + text_h // 2, h))
+
+        # Create a temporary image for text rendering
+        text_img = np.zeros((h, w, 3), dtype=np.uint8)
+        cv2.putText(text_img, label_text, (x, y), font, font_scale, text_color_bgr, thickness)
+
+        # Blend text into RGBA
+        text_mask = np.any(text_img != 0, axis=2)
+        rgba[text_mask, 0] = text_color[0]
+        rgba[text_mask, 1] = text_color[1]
+        rgba[text_mask, 2] = text_color[2]
+        rgba[text_mask, 3] = 1.0
+    
+    return rgba
+
 def auto_brightness_contrast(image):
     normalized_image = image.astype(np.float32) / 255.0
     equalized_image = exposure.equalize_adapthist(normalized_image)
@@ -291,11 +607,9 @@ def organize_data(mask_id, z_sep, stack_depth, metadata_row, filename):
         "X_vals": [x_vals],
         "file_name": [filename],
         "DJID": [metadata_row.get("djid", "")],
-        "Sex": [metadata_row.get("sex", "")],
         "Eye": [metadata_row.get("eye", "")],
-        "Age": [metadata_row.get("age", "")],  # NEW
-        "Genotype": [metadata_row.get("genotype", "")],  # NEW
-        "Treatment": [metadata_row.get("treatment", "")],  # NEW
+        "Treatment": [metadata_row.get("treatment", "")],
+        "Stain": [metadata_row.get("stain", "")],
         "Time_Min": [metadata_row.get("time_min", "")],
         "eGFP_Value": [False],
         "eGFP_Raw_Intensity": [0.0],
@@ -306,7 +620,109 @@ def normalize(array):
     array = np.array(array)
     return (array - array.min()) / (array.max() - array.min())
 
+def segment_images():
+    """
+    Step 1: Segment all images and save segmentation results.
+    Creates a directory with mask images for each analyzed stack.
+    """
+    if GUI_helpers.metadata_df.empty:
+        dpg.set_value("status_text", "No files are ready for segmentation.")
+        return
+
+    dpg.configure_item("segment_images_button", enabled=False)
+    dpg.set_value("trace_file_status", "File: Starting segmentation...")
+    dpg.set_value("trace_status_text", "Status: Preparing models...")
+
+    # Create segmentation output directory
+    folder_name = os.path.basename(GUI_helpers.current_folder.rstrip("/\\"))
+    segmentation_dir = os.path.join(GUI_helpers.current_folder, f"{folder_name}_segmentation")
+    os.makedirs(segmentation_dir, exist_ok=True)
+
+    dapi_model_path = os.path.join(ROOT_DIR, 'CP_models', 'T5_DAPI_V4')
+    dapi_model = denoise.CellposeDenoiseModel(gpu=True, model_type=dapi_model_path, restore_type="deblur_cyto3")
+
+    model_path_wga = os.path.join(ROOT_DIR, 'CP_models', 'T5_WGA_V2')
+    wga_model = models.CellposeModel(gpu=True, pretrained_model=model_path_wga)
+    print('Done loading models for segmentation')
+
+    for idx, row in GUI_helpers.metadata_df.iterrows():
+        filename = row.get("filename")
+        if not isinstance(filename, str) or not filename.strip():
+            dpg.set_value("trace_status_text", "Error: Invalid filename in metadata.")
+            dpg.configure_item("segment_images_button", enabled=True)
+            return
+
+        file_path = os.path.join(GUI_helpers.current_folder, filename)
+        if not os.path.exists(file_path):
+            dpg.set_value("trace_status_text", f"Error: File not found - {file_path}")
+            dpg.configure_item("segment_images_button", enabled=True)
+            return
+
+        z_min, z_max = int(row["z_min"]), int(row["z_max"])
+        dpg.set_value("trace_file_status", f"File: {filename}")
+
+        with nd2.ND2File(file_path) as f:
+            stack = to_8bit(f.asarray())
+            cropped_stack = stack[z_min:z_max+1]
+
+        dapi_stack = cropped_stack[:, 0, :, :]
+        proj = np.max(dapi_stack, axis=0)
+        enhanced = auto_brightness_contrast(proj)
+
+        print('Running dapi model for segmentation')
+        dapi_masks, _, _, _ = dapi_model.eval(enhanced, diameter=None, channels=[0, 0])
+        print('Done running dapi model')
+
+        coords_3d = nuclei_centers_of_mass(dapi_stack, dapi_masks)
+        filtered_coords, filtered_idxs = remove_outliers_local(coords_3d, num_closest_points=15, z_threshold=2)
+
+        mask_ids = np.delete(np.unique(dapi_masks), 0) - 1
+
+        # Save segmentation results for each stack
+        base_name = os.path.splitext(filename)[0]
+        output_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
+        
+        np.savez(output_file,
+                 dapi_masks=dapi_masks,
+                 filtered_idxs=filtered_idxs,
+                 color_assignment=assign_colors_to_masks(dapi_masks),
+                 stack=stack,
+                 cropped_stack=cropped_stack,
+                 dapi_stack=dapi_stack,
+                 filename=filename,
+                 z_min=z_min,
+                 z_max=z_max)
+        
+        print(f"Saved segmentation to: {output_file}")
+        # Verify color assignment was saved
+        saved_data = np.load(output_file, allow_pickle=True)
+        if 'color_assignment' in saved_data:
+            ca = saved_data['color_assignment'].item()
+            print(f"[DEBUG] Verified: {len(ca)} colors saved in npz")
+        
+        # Assign colors to maximize visual differences between adjacent masks
+        color_assignment = assign_colors_to_masks(dapi_masks)
+        
+        # Save a visualization of the segmentation with colors and labels
+        vis_file = os.path.join(segmentation_dir, f"{base_name}_segmentation_vis.png")
+        save_segmentation_visualization(dapi_masks, color_assignment, vis_file)
+
+        dpg.set_value("trace_status_text", f"Segmented {filename}")
+
+    dpg.set_value("trace_file_status", "File: Done with segmentation")
+    dpg.set_value("trace_status_text", f"Status: Segmentation complete. Ready for trace extraction.")
+    dpg.configure_item("segment_images_button", enabled=True)
+    dpg.configure_item("extract_traces_button", enabled=True)
+    
+    # Auto-load and display the last segmented file
+    if GUI_helpers.opened_file:
+        GUI_helpers.load_segmentation_if_available(GUI_helpers.opened_file)
+
 def extract_traces():
+    """
+    Step 2: Extract traces from previously segmented images.
+    Requires segment_images() to have been run first.
+    """
     if GUI_helpers.metadata_df.empty:
         dpg.set_value("status_text", "No files are ready for analysis.")
         return
@@ -315,8 +731,17 @@ def extract_traces():
     print('extract traces')
 
     dpg.configure_item("extract_traces_button", enabled=False)
-    dpg.set_value("trace_file_status", "File: Starting...")
+    dpg.set_value("trace_file_status", "File: Starting trace extraction...")
     dpg.set_value("trace_status_text", "Status: Preparing...")
+
+    # Load segmentation directory
+    folder_name = os.path.basename(GUI_helpers.current_folder.rstrip("/\\"))
+    segmentation_dir = os.path.join(GUI_helpers.current_folder, f"{folder_name}_segmentation")
+    
+    if not os.path.exists(segmentation_dir):
+        dpg.set_value("trace_status_text", "Error: Segmentation not found. Run segmentation first.")
+        dpg.configure_item("extract_traces_button", enabled=True)
+        return
 
     results = []
 
@@ -340,28 +765,32 @@ def extract_traces():
             dpg.configure_item("extract_traces_button", enabled=True)
             return
 
-        z_min, z_max = int(row["z_min"]), int(row["z_max"])
-        dpg.set_value("trace_file_status", f"File: {filename}")
+        # Load segmentation results
+        base_name = os.path.splitext(filename)[0]
+        seg_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
+        
+        if not os.path.exists(seg_file):
+            dpg.set_value("trace_status_text", f"Error: Segmentation not found for {filename}. Run segmentation first.")
+            dpg.configure_item("extract_traces_button", enabled=True)
+            return
+        
+        seg_data = np.load(seg_file, allow_pickle=True)
+        dapi_masks = seg_data['dapi_masks']
+        filtered_idxs = seg_data['filtered_idxs']
+        stack = seg_data['stack']
+        cropped_stack = seg_data['cropped_stack']
+        dapi_stack = seg_data['dapi_stack']
+        z_min = int(seg_data['z_min'])
+        z_max = int(seg_data['z_max'])
 
         with nd2.ND2File(file_path) as f:
             z_sep = f.voxel_size().z
-            stack = to_8bit(f.asarray())
-            cropped_stack = stack[z_min:z_max+1]
+
+        dpg.set_value("trace_file_status", f"File: {filename}")
         print('Found file', z_sep)
 
-        dapi_stack = cropped_stack[:, 0, :, :]
         proj = np.max(dapi_stack, axis=0)
         enhanced = auto_brightness_contrast(proj)
-
-        print('Now running dapi model')
-        dapi_masks, _, _, _ = dapi_model.eval(enhanced, diameter=None, channels=[0, 0])
-        print('Done running dapi model')
-
-        print('Starting coords')
-        coords_3d = nuclei_centers_of_mass(dapi_stack, dapi_masks)
-        print(len(coords_3d))
-        print('Starting filtering')
-        filtered_coords, filtered_idxs = remove_outliers_local(coords_3d, num_closest_points=15, z_threshold=2)
 
         mask_ids = np.delete(np.unique(dapi_masks), 0) - 1
 
@@ -415,8 +844,8 @@ def extract_traces():
             normalized_vals = normalize(egfp_vals)
             trace_data_df["eGFP_Value"] = normalized_vals > 0.2
 
-        trace_data_df["original_mask_id"] = trace_data_df["mask_id"]
-        trace_data_df["mask_id"] = range(len(trace_data_df))
+        # Rename mask_id to Segmentation_Mask_ID to match visualization
+        trace_data_df.rename(columns={"mask_id": "Segmentation_Mask_ID"}, inplace=True)
 
         # Define folder_name once at the top level
         folder_name = os.path.basename(GUI_helpers.current_folder.rstrip("/\\"))
@@ -438,10 +867,10 @@ def extract_traces():
 
             ## Post processing 
             drop_cols = ['X_vals', 'Y_vals_DAPI', 'Y_vals_eGFP','Y_vals_WGA', 'Y_vals_GLUT1',
-                        'original_mask_id', 'Cell','WGA_Middle_Indices', 'DAPI_peak_index',
+                        'Cell','WGA_Middle_Indices', 'DAPI_peak_index',
                         'WGA_Top_Indices','WGA_Bottom_Indices',]
 
-            rename_cols = {'Age': 'Age_Months', 'Treatment':'Experimental_Condition', 'in_rip':'In_Rip',
+            rename_cols = {'Treatment':'Experimental_Condition', 'in_rip':'In_Rip',
                             'Time_Min': 'Time_Condition', 'Length':'Length_um'}
 
             processed_df.drop(columns= drop_cols, axis = 1, inplace = True)
@@ -454,6 +883,26 @@ def extract_traces():
     dpg.set_value("trace_file_status", "File: Done")
     dpg.set_value("trace_status_text", f"Status: Saved to {processed_path}")
     dpg.configure_item("extract_traces_button", enabled=True)
+    
+    # Save filtered segmentation visualization (cells removed shown in gray)
+    folder_name = os.path.basename(GUI_helpers.current_folder.rstrip("/\\"))
+    segmentation_dir = os.path.join(GUI_helpers.current_folder, f"{folder_name}_segmentation")
+    
+    for idx, row in GUI_helpers.metadata_df.iterrows():
+        filename = row.get("filename")
+        if isinstance(filename, str) and filename.strip():
+            base_name = os.path.splitext(filename)[0]
+            seg_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
+            if os.path.exists(seg_file):
+                try:
+                    seg_data = np.load(seg_file, allow_pickle=True)
+                    dapi_masks = seg_data['dapi_masks']
+                    filtered_idxs = seg_data['filtered_idxs']
+                    color_assignment = assign_colors_to_masks(dapi_masks)
+                    filtered_vis_file = os.path.join(segmentation_dir, f"{base_name}_segmentation_filtered_vis.png")
+                    create_filtered_segmentation_visualization(dapi_masks, color_assignment, filtered_idxs, filtered_vis_file)
+                except Exception as e:
+                    print(f"Error saving filtered segmentation for {filename}: {e}")
 
 def run_integral_analysis(trace_data_df):
     df = trace_data_df.copy()
@@ -461,7 +910,7 @@ def run_integral_analysis(trace_data_df):
     print(f"[DEBUG] Starting analysis with {len(df)} rows")
 
     # Add separation and cell identity
-    df["Cell"] = df["file_name"].astype(str) + "_mask" + df["mask_id"].astype(str)
+    df["Cell"] = df["file_name"].astype(str) + "_mask" + df["Segmentation_Mask_ID"].astype(str)
 
     # Peak detection
     df = WGA_Peaks_Finder_V2(df)

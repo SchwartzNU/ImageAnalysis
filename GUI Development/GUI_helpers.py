@@ -21,20 +21,21 @@ gray_img = None
 mask_array = None
 colors = {}
 selected_masks = []
-metadata_df = pd.DataFrame(columns=["filename", "z_min", "z_max", "rip_cells", "sex", "eye", "time_min", "djid", "age", "genotype", "treatment"])
-texture_cache = None
-last_show_masks = True
-metadata_df = pd.DataFrame(columns=["filename", "z_min", "z_max", "rip_cells", "sex", "eye", "time_min", "djid", "age", "genotype", "treatment"])
+segmentation_masks = None  # New: store segmentation masks
+segmentation_colors = {}   # New: store assigned colors
+segmentation_filtered_idxs = None  # New: store which masks pass filtering
+metadata_df = pd.DataFrame(columns=["filename", "z_min", "z_max", "rip_cells", "eye", "time_min", "djid", "treatment", "stain"])
 texture_cache = None
 last_show_masks = True
 last_selected = []
 display_map = {}
 confirmed_rip_masks = {}
+display_map = {}
+confirmed_rip_masks = {}
 
-# Fixed dynamic texture canvas size (power-of-two friendly)
-_TEXTURE_SIZE = 2048
 
 # Texture is created by GUI_Imaging.py at startup; we just use it
+
 
 def to_8bit(arr):
     norm = arr.astype(np.float32)
@@ -44,10 +45,10 @@ def to_8bit(arr):
         norm = norm * 0.0
     return img_as_ubyte(norm)
 
-def _set_dynamic_texture_from_array(rgba):
+def _set_dynamic_texture_from_array(rgba, texture_tag="dynamic_texture"):
     """
-    Put `rgba` into the central region of a single fixed-size dynamic texture
-    and update it via `dpg.set_value`. Rescales if image is larger than the canvas.
+    Update a DearPyGui texture by resizing to fit the display area.
+    Main image: scales to fit 1024x512
     """
     if rgba is None:
         return
@@ -56,28 +57,33 @@ def _set_dynamic_texture_from_array(rgba):
         raise ValueError("rgba must be HxWx4")
 
     h, w = arr.shape[0], arr.shape[1]
+    print(f"[DEBUG] _set_dynamic_texture_from_array: input shape {h}x{w}, texture={texture_tag}")
 
-    # Downscale if needed to fit in canvas while preserving aspect ratio
-    max_side = _TEXTURE_SIZE
-    scale = min(1.0, max_side / max(h, w))
-    if scale < 1.0:
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        arr_resized = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    else:
-        arr_resized = arr
-        new_h, new_w = h, w
+    # For now, only handle main image texture
+    # Segmentation is handled directly in display_segmentation_filtered
+    if texture_tag != "dynamic_texture":
+        print(f"[WARN] _set_dynamic_texture_from_array called with unexpected texture_tag: {texture_tag}")
+        return
 
-    # Place resized image centered in canvas
-    canvas = np.zeros((_TEXTURE_SIZE, _TEXTURE_SIZE, 4), dtype=np.float32)
-    y0 = (_TEXTURE_SIZE - new_h) // 2
-    x0 = (_TEXTURE_SIZE - new_w) // 2
-    canvas[y0:y0 + new_h, x0:x0 + new_w, :] = arr_resized
-
-    # Flatten and update the single texture
+    # Main image: scale to fit 1024x512 maintaining aspect ratio
+    # Calculate scale to fit within 1024x512
+    scale = min(1024 / w, 512 / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    print(f"[DEBUG] Scaling main image by {scale:.3f}: {new_w}x{new_h}")
+    resized = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # Pad to 1024x512
+    canvas = np.zeros((512, 1024, 4), dtype=np.float32)
+    y_offset = (512 - new_h) // 2
+    x_offset = (1024 - new_w) // 2
+    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+    
+    # Flatten and update texture
     flat = canvas.flatten().tolist()
     try:
-        dpg.set_value("dynamic_texture", flat)
+        dpg.set_value(texture_tag, flat)
+        print(f"[DEBUG] Texture updated successfully")
     except Exception as exc:
         print(f"[WARN] set_value failed: {exc}")
 
@@ -197,6 +203,183 @@ def open_folder_dialog(sender, app_data, user_data):
             dpg.hide_item(tag)
     dpg.set_value("status_text", "Folder loaded")
 
+def load_segmentation_if_available(filename):
+    """
+    Load segmentation masks and assign colors if available.
+    """
+    global segmentation_masks, segmentation_colors, segmentation_filtered_idxs
+    
+    # Clear any previous segmentation display immediately
+    if dpg.does_item_exist("segmentation_window"):
+        try:
+            dpg.hide_item("segmentation_window")
+        except Exception:
+            pass
+    # Clear segmentation texture to blank
+    try:
+        if dpg.does_item_exist("segmentation_texture"):
+            blank = np.zeros((512, 1024, 4), dtype=np.float32).flatten().tolist()
+            dpg.set_value("segmentation_texture", blank)
+    except Exception:
+        pass
+    # Do not clear the main image texture here; keep the image visible while loading segmentation
+
+    if current_folder is None or filename is None:
+        segmentation_masks = None
+        segmentation_colors = {}
+        segmentation_filtered_idxs = None
+        return
+    
+    folder_name = os.path.basename(current_folder.rstrip("/\\"))
+    segmentation_dir = os.path.join(current_folder, f"{folder_name}_segmentation")
+    
+    base_name = os.path.splitext(filename)[0]
+    seg_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
+    
+    # Remove all previous segmentation artifacts on load so old visualizations don't auto-load
+    if os.path.exists(segmentation_dir):
+        for f in os.listdir(segmentation_dir):
+            try:
+                full = os.path.join(segmentation_dir, f)
+                # Only remove files (not directories)
+                if os.path.isfile(full):
+                    os.remove(full)
+            except Exception:
+                pass
+    
+    if os.path.exists(seg_file):
+        try:
+            import analysis_helpers
+            seg_data = np.load(seg_file, allow_pickle=True)
+            segmentation_masks = seg_data['dapi_masks']
+            segmentation_filtered_idxs = seg_data['filtered_idxs']
+            # Always recompute a fresh color assignment to ensure good color diversity
+            segmentation_colors = analysis_helpers.assign_colors_to_masks(segmentation_masks)
+            print(f"[DEBUG] Recomputed {len(segmentation_colors)} colors for visualization")
+            # If the file contained a saved color_assignment, keep it in memory for auditing
+            if 'color_assignment' in seg_data:
+                try:
+                    color_dict = seg_data['color_assignment'].item()
+                    print(f"[DEBUG] Found saved color_assignment in npz with {len(color_dict)} entries (not used for display)")
+                except Exception:
+                    pass
+            print(f"Loaded segmentation for {filename}")
+            # Automatically display the segmentation with filtered masks only
+            display_segmentation_filtered()
+        except Exception as e:
+            print(f"Error loading segmentation: {e}")
+            segmentation_masks = None
+            segmentation_colors = {}
+            segmentation_filtered_idxs = None
+    else:
+        segmentation_masks = None
+        segmentation_colors = {}
+        segmentation_filtered_idxs = None
+
+def display_segmentation_filtered():
+    """
+    Display the loaded segmentation with colors and labels, showing only filtered masks.
+    """
+    global segmentation_masks, segmentation_colors, segmentation_filtered_idxs
+    
+    print(f"[DEBUG] display_segmentation_filtered called")
+    print(f"[DEBUG] segmentation_masks is None: {segmentation_masks is None}")
+    print(f"[DEBUG] segmentation_filtered_idxs: {segmentation_filtered_idxs}")
+    
+    if segmentation_masks is None:
+        print("[DEBUG] No segmentation masks loaded, hiding window")
+        if dpg.does_item_exist("segmentation_window"):
+            dpg.hide_item("segmentation_window")
+        return
+    
+    import analysis_helpers
+    # We'll pass the original masks and filtered idxs to the viz function so it can
+    # optionally render removed masks semi-transparently.
+    filtered_masks = segmentation_masks
+    
+    print(f"[DEBUG] segmentation_colors has {len(segmentation_colors)} colors")
+    if segmentation_colors:
+        color_vals = list(segmentation_colors.values())
+        print(f"[DEBUG] First 3 colors: {color_vals[:3]}")
+        unique_colors = set(color_vals)
+        print(f"[DEBUG] Unique colors: {len(unique_colors)}")
+    
+    # Read user preference for showing removed masks; labeling uses a small default area
+    show_removed = dpg.get_value("show_removed_masks") if dpg.does_item_exist("show_removed_masks") else False
+
+    seg_viz = analysis_helpers.create_labeled_segmentation_image(filtered_masks, segmentation_colors,
+                                                                 filtered_idxs=segmentation_filtered_idxs,
+                                                                 label_min_area=5,
+                                                                 force_labels=False,
+                                                                 show_removed=show_removed)
+    h, w = seg_viz.shape[:2]
+    print(f"[DEBUG] Segmentation viz shape: {h}x{w}")
+    
+    # Scale to 1024x512 for display (match main image)
+    scale = min(1024 / w, 512 / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    seg_viz_resized = cv2.resize(seg_viz, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # Create a canvas of the exact size needed (512 high to match main image)
+    canvas = np.zeros((512, 1024, 4), dtype=np.float32)
+    y_offset = (512 - new_h) // 2
+    x_offset = (1024 - new_w) // 2
+    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = seg_viz_resized
+    
+    # Update texture directly
+    flat = canvas.flatten().tolist()
+    try:
+        if dpg.does_item_exist("segmentation_texture"):
+            dpg.set_value("segmentation_texture", flat)
+            print(f"[DEBUG] Set segmentation_texture value")
+        if dpg.does_item_exist("segmentation_window"):
+            dpg.show_item("segmentation_window")
+            print(f"[DEBUG] Showed segmentation_window")
+        print(f"[DEBUG] Displayed segmentation visualization")
+    except Exception as e:
+        print(f"[ERROR] updating segmentation texture: {e}")
+        import traceback
+        traceback.print_exc()
+
+def display_segmentation():
+    """
+    Display the loaded segmentation with colors and labels.
+    """
+    global gray_img, segmentation_masks, segmentation_colors
+    
+    if segmentation_masks is None:
+        return
+    
+    import analysis_helpers
+    # Use default labeling behavior (no force labels, small min area)
+    seg_viz = analysis_helpers.create_labeled_segmentation_image(segmentation_masks, segmentation_colors,
+                                                                 filtered_idxs=None,
+                                                                 label_min_area=5,
+                                                                 force_labels=False,
+                                                                 show_removed=False)
+    h, w = seg_viz.shape[:2]
+    
+    # Scale to 1024x512 for display (match main image)
+    scale = min(1024 / w, 512 / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    seg_viz_resized = cv2.resize(seg_viz, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # Create a canvas of the exact size needed (512 high to match main image)
+    canvas = np.zeros((512, 1024, 4), dtype=np.float32)
+    y_offset = (512 - new_h) // 2
+    x_offset = (1024 - new_w) // 2
+    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = seg_viz_resized
+    
+    # Update texture directly
+    flat = canvas.flatten().tolist()
+    try:
+        if dpg.does_item_exist("segmentation_texture"):
+            dpg.set_value("segmentation_texture", flat)
+    except Exception as e:
+        print(f"[ERROR] updating segmentation texture: {e}")
+
 def contents_list_callback(sender, app_data, user_data):
     display_name = dpg.get_value("contents_list")
     sel = display_map.get(display_name, display_name)
@@ -228,6 +411,9 @@ def open_nd2_callback(sender, app_data, user_data):
         selected_masks.clear()
         colors.clear()
         texture_cache = None
+        
+        # Load segmentation if available
+        load_segmentation_if_available(sel)
 
         # Load image data
         path = os.path.join(current_folder, sel)
@@ -256,11 +442,9 @@ def open_nd2_callback(sender, app_data, user_data):
         dpg.set_value("eye_combo", eye_guess)
 
         # Clear other identifier fields
-        dpg.set_value("sex_combo", "")
         dpg.set_value("time_input", "")
-        dpg.set_value("age_input", "")
-        dpg.set_value("gen_combo", "")
         dpg.set_value("treatment_combo", "")
+        dpg.set_value("stain_combo", "")
 
         # Reset WGA widgets
         dpg.set_value("wga_checkbox", False)
@@ -299,18 +483,16 @@ def open_nd2_callback(sender, app_data, user_data):
         row = metadata_df.loc[metadata_df["filename"] == sel].iloc[0]
         dpg.set_value("z_min_slider", int(row["z_min"]))
         dpg.set_value("z_max_slider", int(row["z_max"]))
-        if pd.notnull(row["sex"]):
-            dpg.set_value("sex_combo", row["sex"])
         if pd.notnull(row["eye"]):
             dpg.set_value("eye_combo", row["eye"])
         if pd.notnull(row["time_min"]):
             dpg.set_value("time_input", str(int(row["time_min"])))
         if pd.notnull(row["djid"]):
             dpg.set_value("djid_input", str(row["djid"]))
-        if pd.notnull(row["age"]):
-            dpg.set_value("age_input", str(row["age"]))
-        if pd.notnull(row["genotype"]):
-            dpg.set_value("gen_combo", row["genotype"])
+        if pd.notnull(row["treatment"]):
+            dpg.set_value("treatment_combo", row["treatment"])
+        if pd.notnull(row["stain"]):
+            dpg.set_value("stain_combo", row["stain"])
         if pd.notnull(row["treatment"]):
             dpg.set_value("treatment_combo", row["treatment"])
 
@@ -340,31 +522,23 @@ def save_metadata_callback(sender, app_data, user_data):
         dpg.set_value("status_text", "No file loaded.")
         return
 
-    sex = dpg.get_value("sex_combo")
     eye = dpg.get_value("eye_combo")
     time_str = dpg.get_value("time_input")
     djid = dpg.get_value("djid_input")
-    age = dpg.get_value("age_input")
-    genotype = dpg.get_value("gen_combo")
     treatment = dpg.get_value("treatment_combo")
+    stain = dpg.get_value("stain_combo")
 
     if not djid.strip():
         dpg.set_value("status_text", "Please enter DJID.")
         return
-    if not age.strip():
-        dpg.set_value("status_text", "Please enter age.")
-        return
-    if not sex:
-        dpg.set_value("status_text", "Please select a sex.")
-        return
     if not eye:
         dpg.set_value("status_text", "Please select an eye.")
         return
-    if not genotype:
-        dpg.set_value("status_text", "Please select a genotype.")
+    if not stain:
+        dpg.set_value("status_text", "Please select a stain.")
         return
     if not treatment:
-        dpg.set_value("status_text", "Please select a treatment group.")
+        dpg.set_value("status_text", "Please select a treatment.")
         return
     if not time_str.strip():
         dpg.set_value("status_text", "Time condition is required.")
@@ -384,13 +558,11 @@ def save_metadata_callback(sender, app_data, user_data):
         "z_min": z0,
         "z_max": z1,
         "rip_cells": [],
-        "sex": sex,
         "eye": eye,
         "time_min": time_min,
         "djid": djid,
-        "age": age,
-        "genotype": genotype,
-        "treatment": treatment
+        "treatment": treatment,
+        "stain": stain
     }
 
     if opened_file in metadata_df["filename"].values:
