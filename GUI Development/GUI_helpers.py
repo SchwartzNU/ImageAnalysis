@@ -24,12 +24,13 @@ selected_masks = []
 segmentation_masks = None  # New: store segmentation masks
 segmentation_colors = {}   # New: store assigned colors
 segmentation_filtered_idxs = None  # New: store which masks pass filtering
+segmentation_filtered_idxs_original = None
+segmentation_npz_path = None
+manual_excluded_masks = set()
 metadata_df = pd.DataFrame(columns=["filename", "z_min", "z_max", "rip_cells", "eye", "time_min", "djid", "treatment", "stain"])
 texture_cache = None
 last_show_masks = True
 last_selected = []
-display_map = {}
-confirmed_rip_masks = {}
 display_map = {}
 confirmed_rip_masks = {}
 
@@ -203,11 +204,27 @@ def open_folder_dialog(sender, app_data, user_data):
             dpg.hide_item(tag)
     dpg.set_value("status_text", "Folder loaded")
 
+def _delete_segmentation_outputs_for_file(filename):
+    if current_folder is None or not filename:
+        return
+    folder_name = os.path.basename(current_folder.rstrip("/\\"))
+    segmentation_dir = os.path.join(current_folder, f"{folder_name}_segmentation")
+    if not os.path.exists(segmentation_dir):
+        return
+    base_name = os.path.splitext(filename)[0]
+    for f in os.listdir(segmentation_dir):
+        if f.startswith(base_name) and f.endswith((".npz", ".png", ".tif", ".tiff")):
+            try:
+                os.remove(os.path.join(segmentation_dir, f))
+            except Exception:
+                pass
+
 def load_segmentation_if_available(filename):
     """
     Load segmentation masks and assign colors if available.
     """
     global segmentation_masks, segmentation_colors, segmentation_filtered_idxs
+    global segmentation_filtered_idxs_original, segmentation_npz_path, manual_excluded_masks
     
     # Clear any previous segmentation display immediately
     if dpg.does_item_exist("segmentation_window"):
@@ -236,23 +253,15 @@ def load_segmentation_if_available(filename):
     base_name = os.path.splitext(filename)[0]
     seg_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
     
-    # Remove all previous segmentation artifacts on load so old visualizations don't auto-load
-    if os.path.exists(segmentation_dir):
-        for f in os.listdir(segmentation_dir):
-            try:
-                full = os.path.join(segmentation_dir, f)
-                # Only remove files (not directories)
-                if os.path.isfile(full):
-                    os.remove(full)
-            except Exception:
-                pass
-    
     if os.path.exists(seg_file):
         try:
             import analysis_helpers
             seg_data = np.load(seg_file, allow_pickle=True)
             segmentation_masks = seg_data['dapi_masks']
-            segmentation_filtered_idxs = seg_data['filtered_idxs']
+            segmentation_filtered_idxs = list(seg_data['filtered_idxs'])
+            segmentation_filtered_idxs_original = list(segmentation_filtered_idxs)
+            segmentation_npz_path = seg_file
+            manual_excluded_masks.clear()
             # Always recompute a fresh color assignment to ensure good color diversity
             segmentation_colors = analysis_helpers.assign_colors_to_masks(segmentation_masks)
             print(f"[DEBUG] Recomputed {len(segmentation_colors)} colors for visualization")
@@ -275,6 +284,9 @@ def load_segmentation_if_available(filename):
         segmentation_masks = None
         segmentation_colors = {}
         segmentation_filtered_idxs = None
+        segmentation_filtered_idxs_original = None
+        segmentation_npz_path = None
+        manual_excluded_masks.clear()
 
 def display_segmentation_filtered():
     """
@@ -304,28 +316,42 @@ def display_segmentation_filtered():
         unique_colors = set(color_vals)
         print(f"[DEBUG] Unique colors: {len(unique_colors)}")
     
-    # Read user preference for showing removed masks; labeling uses a small default area
+    # Read user preference for showing removed masks
     show_removed = dpg.get_value("show_removed_masks") if dpg.does_item_exist("show_removed_masks") else False
+    label_filtered_only = dpg.get_value("label_filtered_only") if dpg.does_item_exist("label_filtered_only") else True
+    overlay_on_image = dpg.get_value("seg_overlay_on_image") if dpg.does_item_exist("seg_overlay_on_image") else False
+    overlay_alpha = dpg.get_value("seg_overlay_alpha") if dpg.does_item_exist("seg_overlay_alpha") else 0.45
 
-    seg_viz = analysis_helpers.create_labeled_segmentation_image(filtered_masks, segmentation_colors,
-                                                                 filtered_idxs=segmentation_filtered_idxs,
-                                                                 label_min_area=5,
-                                                                 force_labels=False,
-                                                                 show_removed=show_removed)
+    # Force labels on ALL masks for comprehensive visibility
+    seg_viz = analysis_helpers.create_labeled_segmentation_image(
+        filtered_masks,
+        segmentation_colors,
+        filtered_idxs=segmentation_filtered_idxs,
+        label_min_area=0,  # Label all masks regardless of size
+        force_labels=True,
+        show_removed=show_removed,
+        label_filtered_only=label_filtered_only,
+        output_size=(1024, 512),
+    )
     h, w = seg_viz.shape[:2]
     print(f"[DEBUG] Segmentation viz shape: {h}x{w}")
-    
-    # Scale to 1024x512 for display (match main image)
-    scale = min(1024 / w, 512 / h)
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    seg_viz_resized = cv2.resize(seg_viz, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    
-    # Create a canvas of the exact size needed (512 high to match main image)
-    canvas = np.zeros((512, 1024, 4), dtype=np.float32)
-    y_offset = (512 - new_h) // 2
-    x_offset = (1024 - new_w) // 2
-    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = seg_viz_resized
+
+    if overlay_on_image and gray_img is not None:
+        base = to_8bit(gray_img).astype(np.float32) / 255.0
+        base_rgba = np.zeros((base.shape[0], base.shape[1], 4), dtype=np.float32)
+        base_rgba[..., :3] = base[..., None]
+        base_rgba[..., 3] = 1.0
+        # Resize base to match display
+        base_resized = cv2.resize(base_rgba, (1024, 512), interpolation=cv2.INTER_AREA)
+        seg_alpha = np.clip(seg_viz[..., 3:4], 0.0, 1.0) * float(np.clip(overlay_alpha, 0.0, 1.0))
+        blended = base_resized.copy()
+        blended[..., :3] = (1.0 - seg_alpha) * blended[..., :3] + seg_alpha * seg_viz[..., :3]
+        blended[..., 3] = 1.0
+        canvas = blended
+    else:
+        # Create a canvas of the exact size needed (512 high to match main image)
+        canvas = np.zeros((512, 1024, 4), dtype=np.float32)
+        canvas[0:h, 0:w] = seg_viz
     
     # Update texture directly
     flat = canvas.flatten().tolist()
@@ -342,6 +368,68 @@ def display_segmentation_filtered():
         import traceback
         traceback.print_exc()
 
+def _recompute_filtered_from_manual():
+    if segmentation_masks is None:
+        return None
+    ids = np.unique(segmentation_masks)
+    ids = ids[ids > 0]
+    keep = [int(mid) - 1 for mid in ids if int(mid) not in manual_excluded_masks]
+    return keep
+
+def segmentation_click_callback(sender, app_data, user_data):
+    if not dpg.does_item_exist("manual_filter_mode") or not dpg.get_value("manual_filter_mode"):
+        return
+    if segmentation_masks is None:
+        return
+    mx, my = dpg.get_mouse_pos(local=False)
+    x0, y0 = dpg.get_item_rect_min("segmentation_drawlist")
+    ix, iy = int(mx - x0), int(my - y0)
+    if ix < 0 or iy < 0 or ix >= 1024 or iy >= 512:
+        return
+    h, w = segmentation_masks.shape
+    x = int(ix * (w / 1024.0))
+    y = int(iy * (h / 512.0))
+    if x < 0 or y < 0 or x >= w or y >= h:
+        return
+    mask_id = int(segmentation_masks[y, x])
+    if mask_id <= 0:
+        return
+    if mask_id in manual_excluded_masks:
+        manual_excluded_masks.remove(mask_id)
+    else:
+        manual_excluded_masks.add(mask_id)
+    new_filtered = _recompute_filtered_from_manual()
+    if new_filtered is not None:
+        global segmentation_filtered_idxs
+        segmentation_filtered_idxs = new_filtered
+    display_segmentation_filtered()
+
+def apply_manual_filter(sender=None, app_data=None, user_data=None):
+    global segmentation_filtered_idxs_original
+    if segmentation_npz_path is None or segmentation_masks is None:
+        return
+    new_filtered = _recompute_filtered_from_manual()
+    if new_filtered is None:
+        return
+    try:
+        seg_data = np.load(segmentation_npz_path, allow_pickle=True)
+        payload = {k: seg_data[k] for k in seg_data.files}
+        payload["filtered_idxs"] = np.array(new_filtered, dtype=int)
+        np.savez(segmentation_npz_path, **payload)
+        segmentation_filtered_idxs_original = list(new_filtered)
+        if dpg.does_item_exist("status_text"):
+            dpg.set_value("status_text", "Manual filter saved to segmentation file")
+    except Exception as exc:
+        if dpg.does_item_exist("status_text"):
+            dpg.set_value("status_text", f"Failed to save manual filter: {exc}")
+
+def reset_manual_filter(sender=None, app_data=None, user_data=None):
+    manual_excluded_masks.clear()
+    if segmentation_filtered_idxs_original is not None:
+        global segmentation_filtered_idxs
+        segmentation_filtered_idxs = list(segmentation_filtered_idxs_original)
+    display_segmentation_filtered()
+
 def display_segmentation():
     """
     Display the loaded segmentation with colors and labels.
@@ -353,24 +441,20 @@ def display_segmentation():
     
     import analysis_helpers
     # Use default labeling behavior (no force labels, small min area)
-    seg_viz = analysis_helpers.create_labeled_segmentation_image(segmentation_masks, segmentation_colors,
-                                                                 filtered_idxs=None,
-                                                                 label_min_area=5,
-                                                                 force_labels=False,
-                                                                 show_removed=False)
+    seg_viz = analysis_helpers.create_labeled_segmentation_image(
+        segmentation_masks,
+        segmentation_colors,
+        filtered_idxs=None,
+        label_min_area=5,
+        force_labels=False,
+        show_removed=False,
+        output_size=(1024, 512),
+    )
     h, w = seg_viz.shape[:2]
-    
-    # Scale to 1024x512 for display (match main image)
-    scale = min(1024 / w, 512 / h)
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    seg_viz_resized = cv2.resize(seg_viz, (new_w, new_h), interpolation=cv2.INTER_AREA)
     
     # Create a canvas of the exact size needed (512 high to match main image)
     canvas = np.zeros((512, 1024, 4), dtype=np.float32)
-    y_offset = (512 - new_h) // 2
-    x_offset = (1024 - new_w) // 2
-    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = seg_viz_resized
+    canvas[0:h, 0:w] = seg_viz
     
     # Update texture directly
     flat = canvas.flatten().tolist()
@@ -412,7 +496,10 @@ def open_nd2_callback(sender, app_data, user_data):
         colors.clear()
         texture_cache = None
         
-        # Load segmentation if available
+        # Remove any prior segmentation outputs for this file so we don't show stale results
+        _delete_segmentation_outputs_for_file(sel)
+
+        # Load segmentation if available (will be empty after delete until re-segmented)
         load_segmentation_if_available(sel)
 
         # Load image data

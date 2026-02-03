@@ -4,6 +4,7 @@ import pandas as pd
 import dearpygui.dearpygui as dpg
 import nd2
 import cv2
+import warnings
 from skimage import exposure, measure
 from scipy.ndimage import center_of_mass
 from scipy.stats import skew
@@ -29,33 +30,25 @@ def assign_colors_to_masks(mask_array):
     if len(unique_masks) == 0:
         return {}
     
-    # Define a palette of highly distinct colors using proper HSV space
+    # Build a large palette with good spread in HSV.
+    # OpenCV HSV: Hue 0-179, Saturation 0-255, Value 0-255.
+    # We use golden-ratio hue stepping to avoid clustering and vary S/V to extend
+    # beyond 180 unique hues when many masks are present.
     palette = []
-    # OpenCV HSV: Hue 0-180, Saturation 0-255, Value 0-255
-    # Generate many distinct colors with different hues, saturations, and values
-    hues = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165]  # 12 hues in 0-180 range (multiply by 180/360)
-    # Define a palette sized to the number of masks (avoid running out of distinct hues)
-    palette = []
-    # OpenCV HSV: Hue 0-180, Saturation 0-255, Value 0-255
     palette_size = max(72, len(unique_masks))
-    # Evenly spaced hues across 0-179
-    hues = np.linspace(0, 179, palette_size, endpoint=False).astype(int)
-    sat = 255
-    val = 255
-    for hue in hues:
-        hsv_color = np.uint8([[[int(hue), sat, val]]])
+    hue_fracs = (np.arange(palette_size) * 0.61803398875) % 1.0
+    sat_cycle = [0.95, 0.80, 0.65]
+    val_cycle = [0.95, 0.85, 0.75]
+    for i, hf in enumerate(hue_fracs):
+        hue = int(hf * 179)
+        sat = int(sat_cycle[i % len(sat_cycle)] * 255)
+        val = int(val_cycle[(i // len(sat_cycle)) % len(val_cycle)] * 255)
+        hsv_color = np.uint8([[[hue, sat, val]]])
         rgb_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2RGB)
         r = float(rgb_color[0, 0, 0]) / 255.0
         g = float(rgb_color[0, 0, 1]) / 255.0
         b = float(rgb_color[0, 0, 2]) / 255.0
         palette.append((r, g, b))
-        print(f"[DEBUG] Palette color range check:")
-        rs = [c[0] for c in palette]
-        gs = [c[1] for c in palette]
-        bs = [c[2] for c in palette]
-        print(f"[DEBUG]   R range: {min(rs):.2f} - {max(rs):.2f}")
-        print(f"[DEBUG]   G range: {min(gs):.2f} - {max(gs):.2f}")
-        print(f"[DEBUG]   B range: {min(bs):.2f} - {max(bs):.2f}")
     
     # Build adjacency graph - masks are adjacent if they touch
     adjacencies = defaultdict(set)
@@ -217,12 +210,20 @@ def create_filtered_segmentation_visualization(mask_array, color_assignment, fil
     
     return rgba
 
-def create_labeled_segmentation_image(mask_array, color_assignment, filtered_idxs=None, label_min_area=5, force_labels=False, show_removed=False):
+def create_labeled_segmentation_image(mask_array, color_assignment, filtered_idxs=None, label_min_area=5, force_labels=False, show_removed=False, output_size=None, label_filtered_only=False):
     """
     Create a segmentation visualization with colored, filled masks and numeric labels.
     Text color is chosen (black or white) based on background brightness.
     Returns: RGBA image as numpy array
     """
+    mask_full = mask_array
+    if output_size is not None:
+        out_w, out_h = output_size
+        if out_w <= 0 or out_h <= 0:
+            raise ValueError("output_size must be positive (width, height)")
+        # Nearest-neighbor to preserve mask ids for coloring.
+        mask_array = cv2.resize(mask_array.astype(np.int32), (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+
     h, w = mask_array.shape
     print(f"[DEBUG] create_labeled_segmentation_image: {len(color_assignment)} colors, mask shape {h}x{w}")
     # Print sample colors
@@ -234,7 +235,7 @@ def create_labeled_segmentation_image(mask_array, color_assignment, filtered_idx
     unique_masks = np.unique(mask_array)
     unique_masks = unique_masks[unique_masks > 0]
 
-        # Draw filled colored masks. If filtered_idxs is provided and show_removed is True, render removed masks in semi-transparent gray.
+    # Draw filled colored masks. If filtered_idxs is provided and show_removed is True, render removed masks in semi-transparent gray.
     for mask_id in unique_masks:
         mask = (mask_array == mask_id)
         kept = True
@@ -259,21 +260,40 @@ def create_labeled_segmentation_image(mask_array, color_assignment, filtered_idx
                 rgba[mask, 2] = 0.25
                 rgba[mask, 3] = 0.35
     
-    # Add labels with dynamic text color. Use regionprops centroid as a robust
-    # fallback and skip extremely small regions unless force_labels is True.
+    # Add labels with dynamic text color. LABEL ALL MASKS regardless of size.
     from skimage.measure import regionprops
-    for mask_id in unique_masks:
-        mask_bool = (mask_array == mask_id)
+    labels_added = 0
+    labels_skipped = 0
+
+    # Render labels on full resolution mask to avoid downscale blur,
+    # then resize the text overlay if output_size is requested.
+    full_h, full_w = mask_full.shape
+    text_img_full = np.zeros((full_h, full_w, 3), dtype=np.uint8)
+    text_mask_full = np.zeros((full_h, full_w), dtype=np.uint8)
+
+    filtered_set = set(filtered_idxs) if filtered_idxs is not None else None
+    unique_full = np.unique(mask_full)
+    unique_full = unique_full[unique_full > 0]
+    scale_factor = 1.0
+    if output_size is not None:
+        scale_x = w / float(full_w) if full_w else 1.0
+        scale_y = h / float(full_h) if full_h else 1.0
+        scale_factor = min(scale_x, scale_y)
+
+    for mask_id in unique_full:
+        if label_filtered_only and filtered_set is not None and (mask_id - 1) not in filtered_set:
+            continue
+        mask_bool = (mask_full == mask_id)
         mask = mask_bool.astype(np.uint8)
 
-        # Use regionprops for robust measurements
         props = regionprops(mask)
         if not props:
             continue
         prop = props[0]
         area = prop.area
-        # Skip labeling very small regions unless forced
-        if (not force_labels) and area < label_min_area:
+
+        if not force_labels and area < label_min_area:
+            labels_skipped += 1
             continue
 
         # Centroid (row, col)
@@ -295,40 +315,49 @@ def create_labeled_segmentation_image(mask_array, color_assignment, filtered_idx
         # Create label text
         label_text = str(int(mask_id))
         font = cv2.FONT_HERSHEY_SIMPLEX
-        # Scale font with area so larger masks get larger text
-        font_scale = 0.5 if area < 200 else 0.8
-        thickness = 2 if area >= 200 else 1
+        # Keep labels visible even for tiny masks
+        font_scale = 0.6 if area >= 200 else 0.45
+        if scale_factor < 1.0 and scale_factor > 0:
+            # Compensate for downscale so text stays readable
+            font_scale = min(font_scale / scale_factor, 2.0)
+        thickness = 1
 
-        # Determine bounding box for this region and adapt font to fit within it
-        minr, minc, maxr, maxc = prop.bbox
-        bbox_w = max(1, maxc - minc)
-        bbox_h = max(1, maxr - minr)
-
-        # Start with base font scale and reduce until it fits within the bbox width
         text_size, _ = cv2.getTextSize(label_text, font, font_scale, thickness)
         text_w, text_h = text_size
-        max_text_w = max(1, bbox_w - 4)
-        while text_w > max_text_w and font_scale > 0.2:
-            font_scale -= 0.1
-            text_size, _ = cv2.getTextSize(label_text, font, font_scale, thickness)
-            text_w, text_h = text_size
 
-        # Place text centered in the region's bbox and clamp to image bounds
-        cx_clamped = int(min(max(cx, minc + text_w // 2), maxc - text_w // 2))
-        cy_clamped = int(min(max(cy, minr + text_h // 2), maxr - text_h // 2))
-        x = max(0, min(cx_clamped - text_w // 2, w - text_w))
-        y = max(text_h, min(cy_clamped + text_h // 2, h))
+        # Center text on centroid and clamp to image bounds
+        x = max(0, min(cx - text_w // 2, full_w - text_w))
+        y = max(text_h, min(cy + text_h // 2, full_h))
 
-        # Create a temporary image for text rendering
-        text_img = np.zeros((h, w, 3), dtype=np.uint8)
-        cv2.putText(text_img, label_text, (x, y), font, font_scale, text_color_bgr, thickness)
+        # Draw a mask for the text (always white) so black text is not lost
+        temp_mask = np.zeros((full_h, full_w), dtype=np.uint8)
+        cv2.putText(temp_mask, label_text, (x, y), font, font_scale, 255, thickness)
+        if np.any(temp_mask):
+            text_mask_full = np.maximum(text_mask_full, temp_mask)
+            # Apply the requested text color (can be black or white)
+            text_img_full[temp_mask > 0, 0] = text_color_bgr[0]
+            text_img_full[temp_mask > 0, 1] = text_color_bgr[1]
+            text_img_full[temp_mask > 0, 2] = text_color_bgr[2]
+        labels_added += 1
 
-        # Blend text into RGBA
-        text_mask = np.any(text_img != 0, axis=2)
-        rgba[text_mask, 0] = text_color[0]
-        rgba[text_mask, 1] = text_color[1]
-        rgba[text_mask, 2] = text_color[2]
+    # Resize text overlay if needed and blend into RGBA
+    text_img = text_img_full
+    text_mask = text_mask_full
+    if output_size is not None and (text_img_full.shape[1] != w or text_img_full.shape[0] != h):
+        text_img = cv2.resize(text_img_full, (w, h), interpolation=cv2.INTER_NEAREST)
+        text_mask = cv2.resize(text_mask_full, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    text_mask = text_mask > 0
+    if np.any(text_mask):
+        # text_img is BGR; convert to RGB channels
+        rgba[text_mask, 0] = text_img[..., 2][text_mask] / 255.0
+        rgba[text_mask, 1] = text_img[..., 1][text_mask] / 255.0
+        rgba[text_mask, 2] = text_img[..., 0][text_mask] / 255.0
         rgba[text_mask, 3] = 1.0
+    else:
+        labels_skipped = len(unique_full)
+    
+    print(f"[DEBUG] Labels added: {labels_added}, skipped: {labels_skipped}")
     
     return rgba
 
@@ -637,6 +666,14 @@ def segment_images():
     folder_name = os.path.basename(GUI_helpers.current_folder.rstrip("/\\"))
     segmentation_dir = os.path.join(GUI_helpers.current_folder, f"{folder_name}_segmentation")
     os.makedirs(segmentation_dir, exist_ok=True)
+
+    # Suppress torch.load FutureWarning emitted by cellpose internals
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=r".*weights_only=False.*",
+        module=r"cellpose.*",
+    )
 
     dapi_model_path = os.path.join(ROOT_DIR, 'CP_models', 'T5_DAPI_V4')
     dapi_model = denoise.CellposeDenoiseModel(gpu=True, model_type=dapi_model_path, restore_type="deblur_cyto3")

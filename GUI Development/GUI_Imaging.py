@@ -122,6 +122,13 @@ with dpg.window(tag="analysis_panel", label="Analysis Panel", pos=(10, 870), wid
     with dpg.group(tag="seg_options_group"):
         dpg.add_text("Segmentation Options", color=(180,180,255))
         dpg.add_checkbox(label="Show Removed Masks (grey)", tag="show_removed_masks", default_value=True, callback=lambda s,a,u: gh.display_segmentation_filtered())
+        dpg.add_checkbox(label="Label Filtered Masks Only", tag="label_filtered_only", default_value=True, callback=lambda s,a,u: gh.display_segmentation_filtered())
+        dpg.add_checkbox(label="Overlay On Image", tag="seg_overlay_on_image", default_value=False, callback=lambda s,a,u: gh.display_segmentation_filtered())
+        dpg.add_slider_float(label="Overlay Alpha", tag="seg_overlay_alpha", min_value=0.0, max_value=1.0, default_value=0.45, width=160, callback=lambda s,a,u: gh.display_segmentation_filtered())
+        dpg.add_checkbox(label="Manual Filter Mode", tag="manual_filter_mode", default_value=False)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Apply Manual Filter", tag="apply_manual_filter_button", callback=gh.apply_manual_filter, width=150)
+            dpg.add_button(label="Reset Manual Filter", tag="reset_manual_filter_button", callback=gh.reset_manual_filter, width=150)
     dpg.add_text("File: None", tag="trace_file_status", wrap=280)
     dpg.add_text("Status: Waiting", tag="trace_status_text", wrap=280)
 
@@ -136,6 +143,9 @@ with dpg.window(tag="right_window", label="Image Panel", pos=(350, 10), width=10
 with dpg.window(tag="segmentation_window", label="Segmentation", pos=(350, 620), width=1070, height=540):
     with dpg.drawlist(tag="segmentation_drawlist", width=1024, height=512):
         dpg.draw_image("segmentation_texture", (0, 0), (1024, 512))
+    seg_handler = dpg.add_item_handler_registry()
+    dpg.add_item_clicked_handler(callback=gh.segmentation_click_callback, parent=seg_handler)
+    dpg.bind_item_handler_registry("segmentation_drawlist", seg_handler)
 
 dpg.setup_dearpygui()
 dpg.show_viewport()
