@@ -26,6 +26,7 @@ segmentation_colors = {}   # New: store assigned colors
 segmentation_filtered_idxs = None  # New: store which masks pass filtering
 segmentation_filtered_idxs_original = None
 segmentation_npz_path = None
+segmentation_display_rect = None
 manual_excluded_masks = set()
 metadata_df = pd.DataFrame(columns=["filename", "z_min", "z_max", "rip_cells", "eye", "time_min", "djid", "treatment", "stain"])
 texture_cache = None
@@ -87,6 +88,27 @@ def _set_dynamic_texture_from_array(rgba, texture_tag="dynamic_texture"):
         print(f"[DEBUG] Texture updated successfully")
     except Exception as exc:
         print(f"[WARN] set_value failed: {exc}")
+
+def _fit_rgba_to_canvas(rgba, canvas_w=1024, canvas_h=512):
+    """
+    Scale RGBA content to fit inside a fixed canvas while preserving aspect ratio.
+    Returns the padded canvas and the drawn rectangle as (x_offset, y_offset, new_w, new_h).
+    """
+    arr = np.asarray(rgba, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        raise ValueError("rgba must be HxWx4")
+
+    h, w = arr.shape[:2]
+    scale = min(canvas_w / w, canvas_h / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((canvas_h, canvas_w, 4), dtype=np.float32)
+    y_offset = (canvas_h - new_h) // 2
+    x_offset = (canvas_w - new_w) // 2
+    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+    return canvas, (x_offset, y_offset, new_w, new_h)
 
 def normalize_image_fixed(img):
     return img.astype(np.float32) / 255.0
@@ -262,16 +284,16 @@ def load_segmentation_if_available(filename):
             segmentation_filtered_idxs_original = list(segmentation_filtered_idxs)
             segmentation_npz_path = seg_file
             manual_excluded_masks.clear()
-            # Always recompute a fresh color assignment to ensure good color diversity
-            segmentation_colors = analysis_helpers.assign_colors_to_masks(segmentation_masks)
-            print(f"[DEBUG] Recomputed {len(segmentation_colors)} colors for visualization")
-            # If the file contained a saved color_assignment, keep it in memory for auditing
-            if 'color_assignment' in seg_data:
+            if 'color_assignment' in seg_data.files:
                 try:
-                    color_dict = seg_data['color_assignment'].item()
-                    print(f"[DEBUG] Found saved color_assignment in npz with {len(color_dict)} entries (not used for display)")
+                    segmentation_colors = seg_data['color_assignment'].item()
+                    print(f"[DEBUG] Loaded {len(segmentation_colors)} colors from npz")
                 except Exception:
-                    pass
+                    segmentation_colors = analysis_helpers.assign_colors_to_masks(segmentation_masks)
+                    print(f"[DEBUG] Recomputed {len(segmentation_colors)} colors after color_assignment load failed")
+            else:
+                segmentation_colors = analysis_helpers.assign_colors_to_masks(segmentation_masks)
+                print(f"[DEBUG] Recomputed {len(segmentation_colors)} colors for visualization")
             print(f"Loaded segmentation for {filename}")
             # Automatically display the segmentation with filtered masks only
             display_segmentation_filtered()
@@ -292,7 +314,7 @@ def display_segmentation_filtered():
     """
     Display the loaded segmentation with colors and labels, showing only filtered masks.
     """
-    global segmentation_masks, segmentation_colors, segmentation_filtered_idxs
+    global segmentation_masks, segmentation_colors, segmentation_filtered_idxs, segmentation_display_rect
     
     print(f"[DEBUG] display_segmentation_filtered called")
     print(f"[DEBUG] segmentation_masks is None: {segmentation_masks is None}")
@@ -331,7 +353,6 @@ def display_segmentation_filtered():
         force_labels=True,
         show_removed=show_removed,
         label_filtered_only=label_filtered_only,
-        output_size=(1024, 512),
     )
     h, w = seg_viz.shape[:2]
     print(f"[DEBUG] Segmentation viz shape: {h}x{w}")
@@ -341,17 +362,13 @@ def display_segmentation_filtered():
         base_rgba = np.zeros((base.shape[0], base.shape[1], 4), dtype=np.float32)
         base_rgba[..., :3] = base[..., None]
         base_rgba[..., 3] = 1.0
-        # Resize base to match display
-        base_resized = cv2.resize(base_rgba, (1024, 512), interpolation=cv2.INTER_AREA)
         seg_alpha = np.clip(seg_viz[..., 3:4], 0.0, 1.0) * float(np.clip(overlay_alpha, 0.0, 1.0))
-        blended = base_resized.copy()
+        blended = base_rgba.copy()
         blended[..., :3] = (1.0 - seg_alpha) * blended[..., :3] + seg_alpha * seg_viz[..., :3]
         blended[..., 3] = 1.0
-        canvas = blended
+        canvas, segmentation_display_rect = _fit_rgba_to_canvas(blended)
     else:
-        # Create a canvas of the exact size needed (512 high to match main image)
-        canvas = np.zeros((512, 1024, 4), dtype=np.float32)
-        canvas[0:h, 0:w] = seg_viz
+        canvas, segmentation_display_rect = _fit_rgba_to_canvas(seg_viz)
     
     # Update texture directly
     flat = canvas.flatten().tolist()
@@ -379,16 +396,19 @@ def _recompute_filtered_from_manual():
 def segmentation_click_callback(sender, app_data, user_data):
     if not dpg.does_item_exist("manual_filter_mode") or not dpg.get_value("manual_filter_mode"):
         return
-    if segmentation_masks is None:
+    if segmentation_masks is None or segmentation_display_rect is None:
         return
     mx, my = dpg.get_mouse_pos(local=False)
     x0, y0 = dpg.get_item_rect_min("segmentation_drawlist")
     ix, iy = int(mx - x0), int(my - y0)
     if ix < 0 or iy < 0 or ix >= 1024 or iy >= 512:
         return
+    disp_x, disp_y, disp_w, disp_h = segmentation_display_rect
+    if ix < disp_x or iy < disp_y or ix >= disp_x + disp_w or iy >= disp_y + disp_h:
+        return
     h, w = segmentation_masks.shape
-    x = int(ix * (w / 1024.0))
-    y = int(iy * (h / 512.0))
+    x = int((ix - disp_x) * (w / float(disp_w)))
+    y = int((iy - disp_y) * (h / float(disp_h)))
     if x < 0 or y < 0 or x >= w or y >= h:
         return
     mask_id = int(segmentation_masks[y, x])
@@ -434,7 +454,7 @@ def display_segmentation():
     """
     Display the loaded segmentation with colors and labels.
     """
-    global gray_img, segmentation_masks, segmentation_colors
+    global gray_img, segmentation_masks, segmentation_colors, segmentation_display_rect
     
     if segmentation_masks is None:
         return
@@ -448,13 +468,8 @@ def display_segmentation():
         label_min_area=5,
         force_labels=False,
         show_removed=False,
-        output_size=(1024, 512),
     )
-    h, w = seg_viz.shape[:2]
-    
-    # Create a canvas of the exact size needed (512 high to match main image)
-    canvas = np.zeros((512, 1024, 4), dtype=np.float32)
-    canvas[0:h, 0:w] = seg_viz
+    canvas, segmentation_display_rect = _fit_rgba_to_canvas(seg_viz)
     
     # Update texture directly
     flat = canvas.flatten().tolist()

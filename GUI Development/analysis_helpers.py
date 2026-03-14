@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import pandas as pd
 import dearpygui.dearpygui as dpg
@@ -6,7 +7,7 @@ import nd2
 import cv2
 import warnings
 from skimage import exposure, measure
-from scipy.ndimage import center_of_mass
+from scipy.ndimage import center_of_mass, sum as nd_sum
 from scipy.stats import skew
 from scipy.signal import find_peaks
 from skimage.measure import label, regionprops
@@ -50,24 +51,46 @@ def assign_colors_to_masks(mask_array):
         b = float(rgb_color[0, 0, 2]) / 255.0
         palette.append((r, g, b))
     
-    # Build adjacency graph - masks are adjacent if they touch
+    # Build adjacency graph from neighboring label pixels.
+    # This avoids the previous O(n^2) pairwise mask-vs-mask dilation pass.
     adjacencies = defaultdict(set)
-    for mask_id in unique_masks:
-        mask = (mask_array == mask_id).astype(np.uint8)
-        # Dilate slightly to find neighbors
-        dilated = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
-        # Find which masks overlap with dilated region
-        for other_id in unique_masks:
-            if other_id != mask_id:
-                other_mask = (mask_array == other_id).astype(np.uint8)
-                if np.any(dilated & other_mask):  # Both are uint8, bitwise AND works
-                    adjacencies[mask_id].add(other_id)
+    h, w = mask_array.shape
+    for dy, dx in ((1, 0), (0, 1), (1, 1), (1, -1)):
+        if dy >= 0:
+            a_y = slice(dy, h)
+            b_y = slice(0, h - dy)
+        else:
+            a_y = slice(0, h + dy)
+            b_y = slice(-dy, h)
+
+        if dx >= 0:
+            a_x = slice(dx, w)
+            b_x = slice(0, w - dx)
+        else:
+            a_x = slice(0, w + dx)
+            b_x = slice(-dx, w)
+
+        a = mask_array[a_y, a_x]
+        b = mask_array[b_y, b_x]
+        valid = (a > 0) & (b > 0) & (a != b)
+        if not np.any(valid):
+            continue
+
+        pairs = np.column_stack((a[valid].ravel(), b[valid].ravel()))
+        pairs.sort(axis=1)
+        for left, right in np.unique(pairs, axis=0):
+            left = int(left)
+            right = int(right)
+            adjacencies[left].add(right)
+            adjacencies[right].add(left)
     
     # Improved greedy assignment: prefer palette colors that maximize color-distance
     # to already-assigned neighboring colors so we use many distinct colors while
     # still avoiding exact adjacency matches.
     color_assignment = {}
     sorted_masks = sorted(unique_masks, key=lambda x: -len(adjacencies[x]))
+    palette_usage = [0] * len(palette)
+    palette_indices = {color: i for i, color in enumerate(palette)}
 
     def color_distance(c1, c2):
         return (c1[0]-c2[0])**2 + (c1[1]-c2[1])**2 + (c1[2]-c2[2])**2
@@ -85,9 +108,8 @@ def assign_colors_to_masks(mask_array):
             if color in adjacent_colors:
                 continue
             if not adjacent_colors:
-                # No assigned neighbors yet -> prefer colors that are not yet used globally
-                # Score by inverse of how many times color already used
-                used_count = sum(1 for v in color_assignment.values() if v == color)
+                # No assigned neighbors yet -> prefer colors that are not yet used globally.
+                used_count = palette_usage[palette_indices[color]]
                 score = 1.0 / (1 + used_count)
             else:
                 # Score is the minimal squared distance to neighbors
@@ -99,11 +121,12 @@ def assign_colors_to_masks(mask_array):
                 best_color = color
 
         if best_color is None:
-            # Fallback: pick a palette color with minimal global usage
-            counts = {c: sum(1 for v in color_assignment.values() if v == c) for c in palette}
-            best_color = min(counts.keys(), key=lambda c: counts[c])
+            # Fallback: pick a palette color with minimal global usage.
+            best_idx = int(np.argmin(palette_usage))
+            best_color = palette[best_idx]
 
         color_assignment[mask_id] = best_color
+        palette_usage[palette_indices[best_color]] += 1
 
     # Debug: Check what colors got assigned
     if len(color_assignment) > 0:
@@ -272,24 +295,17 @@ def create_labeled_segmentation_image(mask_array, color_assignment, filtered_idx
     text_mask_full = np.zeros((full_h, full_w), dtype=np.uint8)
 
     filtered_set = set(filtered_idxs) if filtered_idxs is not None else None
-    unique_full = np.unique(mask_full)
-    unique_full = unique_full[unique_full > 0]
+    regions = regionprops(mask_full.astype(np.int32))
     scale_factor = 1.0
     if output_size is not None:
         scale_x = w / float(full_w) if full_w else 1.0
         scale_y = h / float(full_h) if full_h else 1.0
         scale_factor = min(scale_x, scale_y)
 
-    for mask_id in unique_full:
+    for prop in regions:
+        mask_id = prop.label
         if label_filtered_only and filtered_set is not None and (mask_id - 1) not in filtered_set:
             continue
-        mask_bool = (mask_full == mask_id)
-        mask = mask_bool.astype(np.uint8)
-
-        props = regionprops(mask)
-        if not props:
-            continue
-        prop = props[0]
         area = prop.area
 
         if not force_labels and area < label_min_area:
@@ -355,7 +371,7 @@ def create_labeled_segmentation_image(mask_array, color_assignment, filtered_idx
         rgba[text_mask, 2] = text_img[..., 0][text_mask] / 255.0
         rgba[text_mask, 3] = 1.0
     else:
-        labels_skipped = len(unique_full)
+        labels_skipped = len(regions)
     
     print(f"[DEBUG] Labels added: {labels_added}, skipped: {labels_skipped}")
     
@@ -587,20 +603,12 @@ def nuclei_centers_of_mass(stack, masks):
 
     # Common case: masks is 2D, stack is 3D -> get 2D centroid and pick z by max signal
     if masks.ndim == 2 and stack.ndim == 3:
-        centers = []
-        z_depth = stack.shape[0]
-        for lab in ids:
-            mask2d = (masks == lab)
-            if not mask2d.any():
-                continue
-            com2d = center_of_mass(mask2d)
-            z_sums = np.array([np.sum(stack[z][mask2d]) for z in range(z_depth)])
-            if np.all(z_sums == 0):
-                z_idx = int(z_depth // 2)
-            else:
-                z_idx = int(np.argmax(z_sums))
-            centers.append((float(com2d[0]), float(com2d[1]), float(z_idx)))
-        return np.array(centers)
+        com2d = np.array(center_of_mass(np.ones_like(masks, dtype=np.float32), labels=masks, index=ids))
+        z_sums = np.vstack([nd_sum(stack[z], labels=masks, index=ids) for z in range(stack.shape[0])])
+        z_idx = np.argmax(z_sums, axis=0)
+        zero_signal = np.all(z_sums == 0, axis=0)
+        z_idx[zero_signal] = stack.shape[0] // 2
+        return np.column_stack((com2d[:, 0], com2d[:, 1], z_idx.astype(np.float32)))
 
     # Fallback to scipy (safe)
     try:
@@ -677,12 +685,10 @@ def segment_images():
 
     dapi_model_path = os.path.join(ROOT_DIR, 'CP_models', 'T5_DAPI_V4')
     dapi_model = denoise.CellposeDenoiseModel(gpu=True, model_type=dapi_model_path, restore_type="deblur_cyto3")
-
-    model_path_wga = os.path.join(ROOT_DIR, 'CP_models', 'T5_WGA_V2')
-    wga_model = models.CellposeModel(gpu=True, pretrained_model=model_path_wga)
     print('Done loading models for segmentation')
 
     for idx, row in GUI_helpers.metadata_df.iterrows():
+        file_timer = time.perf_counter()
         filename = row.get("filename")
         if not isinstance(filename, str) or not filename.strip():
             dpg.set_value("trace_status_text", "Error: Invalid filename in metadata.")
@@ -706,45 +712,45 @@ def segment_images():
         proj = np.max(dapi_stack, axis=0)
         enhanced = auto_brightness_contrast(proj)
 
-        print('Running dapi model for segmentation')
+        print(f'Running dapi model for segmentation: {filename}')
+        step_timer = time.perf_counter()
         dapi_masks, _, _, _ = dapi_model.eval(enhanced, diameter=None, channels=[0, 0])
-        print('Done running dapi model')
+        print(f'Done running dapi model in {time.perf_counter() - step_timer:.2f}s')
 
+        step_timer = time.perf_counter()
         coords_3d = nuclei_centers_of_mass(dapi_stack, dapi_masks)
-        filtered_coords, filtered_idxs = remove_outliers_local(coords_3d, num_closest_points=15, z_threshold=2)
+        print(f'Computed nuclei centers in {time.perf_counter() - step_timer:.2f}s')
 
-        mask_ids = np.delete(np.unique(dapi_masks), 0) - 1
+        step_timer = time.perf_counter()
+        _, filtered_idxs = remove_outliers_local(coords_3d, num_closest_points=15, z_threshold=2)
+        print(f'Filtered nuclei outliers in {time.perf_counter() - step_timer:.2f}s')
+
+        step_timer = time.perf_counter()
+        color_assignment = assign_colors_to_masks(dapi_masks)
+        print(f'Assigned segmentation colors in {time.perf_counter() - step_timer:.2f}s')
 
         # Save segmentation results for each stack
         base_name = os.path.splitext(filename)[0]
         output_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
-        
+
+        step_timer = time.perf_counter()
         np.savez(output_file,
                  dapi_masks=dapi_masks,
                  filtered_idxs=filtered_idxs,
-                 color_assignment=assign_colors_to_masks(dapi_masks),
-                 stack=stack,
-                 cropped_stack=cropped_stack,
-                 dapi_stack=dapi_stack,
+                 color_assignment=color_assignment,
                  filename=filename,
                  z_min=z_min,
                  z_max=z_max)
-        
-        print(f"Saved segmentation to: {output_file}")
-        # Verify color assignment was saved
-        saved_data = np.load(output_file, allow_pickle=True)
-        if 'color_assignment' in saved_data:
-            ca = saved_data['color_assignment'].item()
-            print(f"[DEBUG] Verified: {len(ca)} colors saved in npz")
-        
-        # Assign colors to maximize visual differences between adjacent masks
-        color_assignment = assign_colors_to_masks(dapi_masks)
-        
+        print(f"Saved segmentation to: {output_file} in {time.perf_counter() - step_timer:.2f}s")
+
         # Save a visualization of the segmentation with colors and labels
         vis_file = os.path.join(segmentation_dir, f"{base_name}_segmentation_vis.png")
+        step_timer = time.perf_counter()
         save_segmentation_visualization(dapi_masks, color_assignment, vis_file)
+        print(f"Saved segmentation visualization in {time.perf_counter() - step_timer:.2f}s")
 
         dpg.set_value("trace_status_text", f"Segmented {filename}")
+        print(f"Finished segmentation pipeline for {filename} in {time.perf_counter() - file_timer:.2f}s")
 
     dpg.set_value("trace_file_status", "File: Done with segmentation")
     dpg.set_value("trace_status_text", f"Status: Segmentation complete. Ready for trace extraction.")
@@ -782,9 +788,6 @@ def extract_traces():
 
     results = []
 
-    dapi_model_path = os.path.join(ROOT_DIR, 'CP_models', 'T5_DAPI_V4')
-    dapi_model = denoise.CellposeDenoiseModel(gpu=True, model_type=dapi_model_path, restore_type="deblur_cyto3")
-
     model_path_wga = os.path.join(ROOT_DIR, 'CP_models', 'T5_WGA_V2')
     wga_model = models.CellposeModel(gpu=True, pretrained_model=model_path_wga)
     print('done loading models')
@@ -814,20 +817,16 @@ def extract_traces():
         seg_data = np.load(seg_file, allow_pickle=True)
         dapi_masks = seg_data['dapi_masks']
         filtered_idxs = seg_data['filtered_idxs']
-        stack = seg_data['stack']
-        cropped_stack = seg_data['cropped_stack']
-        dapi_stack = seg_data['dapi_stack']
         z_min = int(seg_data['z_min'])
         z_max = int(seg_data['z_max'])
 
         with nd2.ND2File(file_path) as f:
             z_sep = f.voxel_size().z
+            stack = to_8bit(f.asarray())
+        dapi_stack = stack[z_min:z_max+1, 0, :, :]
 
         dpg.set_value("trace_file_status", f"File: {filename}")
         print('Found file', z_sep)
-
-        proj = np.max(dapi_stack, axis=0)
-        enhanced = auto_brightness_contrast(proj)
 
         mask_ids = np.delete(np.unique(dapi_masks), 0) - 1
 
