@@ -213,12 +213,12 @@ def create_filtered_segmentation_visualization(mask_array, color_assignment, fil
             # Draw text
             x = max(0, min(cx - text_w // 2, w - text_w))
             y = max(text_h, min(cy + text_h // 2, h))
-            
-            text_img = np.zeros((h, w, 3), dtype=np.uint8)
-            cv2.putText(text_img, label_text, (x, y), font, font_scale, text_color_bgr, thickness)
-            
-            # Blend text into RGBA
-            text_mask = np.any(text_img != 0, axis=2)
+
+            temp_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.putText(temp_mask, label_text, (x, y), font, font_scale, 255, thickness)
+
+            # Blend text into RGBA using an explicit mask so black text is preserved.
+            text_mask = temp_mask > 0
             rgba[text_mask, 0] = text_color[0]
             rgba[text_mask, 1] = text_color[1]
             rgba[text_mask, 2] = text_color[2]
@@ -683,9 +683,8 @@ def segment_images():
         module=r"cellpose.*",
     )
 
-    dapi_model_path = os.path.join(ROOT_DIR, 'CP_models', 'T5_DAPI_V4')
-    dapi_model = denoise.CellposeDenoiseModel(gpu=True, model_type=dapi_model_path, restore_type="deblur_cyto3")
-    print('Done loading models for segmentation')
+    recompute_existing = dpg.get_value("recompute_segmentation") if dpg.does_item_exist("recompute_segmentation") else False
+    dapi_model = None
 
     for idx, row in GUI_helpers.metadata_df.iterrows():
         file_timer = time.perf_counter()
@@ -703,6 +702,18 @@ def segment_images():
 
         z_min, z_max = int(row["z_min"]), int(row["z_max"])
         dpg.set_value("trace_file_status", f"File: {filename}")
+
+        base_name = os.path.splitext(filename)[0]
+        output_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
+        if os.path.exists(output_file) and not recompute_existing:
+            dpg.set_value("trace_status_text", f"Loaded saved segmentation for {filename}")
+            print(f"Using existing segmentation for {filename}: {output_file}")
+            continue
+
+        if dapi_model is None:
+            dapi_model_path = os.path.join(ROOT_DIR, 'CP_models', 'T5_DAPI_V4')
+            dapi_model = denoise.CellposeDenoiseModel(gpu=True, model_type=dapi_model_path, restore_type="deblur_cyto3")
+            print('Done loading models for segmentation')
 
         with nd2.ND2File(file_path) as f:
             stack = to_8bit(f.asarray())
@@ -728,10 +739,6 @@ def segment_images():
         step_timer = time.perf_counter()
         color_assignment = assign_colors_to_masks(dapi_masks)
         print(f'Assigned segmentation colors in {time.perf_counter() - step_timer:.2f}s')
-
-        # Save segmentation results for each stack
-        base_name = os.path.splitext(filename)[0]
-        output_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
 
         step_timer = time.perf_counter()
         np.savez(output_file,

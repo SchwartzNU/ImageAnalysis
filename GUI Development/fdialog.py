@@ -466,7 +466,7 @@ class FileDialog:
 
                 # Verify if the directory exists
                 os.listdir(directory_path)  # Test access
-            except FileNotFoundError:
+            except (FileNotFoundError, PermissionError):
                 # Search for the directory in the user's home folder
                 search_path = os.path.expanduser("~/*/" + directory_name)
                 directory_path = glob.glob(search_path)
@@ -476,13 +476,9 @@ class FileDialog:
                         os.listdir(directory_path[0])
                         # Use the found path
                         directory_path = directory_path[0]
-                    except FileNotFoundError:
-                        message_box("File dialog - Error",
-                                    "Could not find the selected directory")
+                    except (FileNotFoundError, PermissionError):
                         return "."
                 else:
-                    message_box("File dialog - Error",
-                                "Could not find the selected directory")
                     return "."
 
             return directory_path

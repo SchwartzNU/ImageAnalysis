@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import pandas as pd
 import tkinter as tk
@@ -12,6 +13,8 @@ import cv2
 from fdialog import FileDialog
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+CANVAS_WIDTH = 1024
+CANVAS_HEIGHT = 512
 
 current_folder = None
 opened_file = None
@@ -27,8 +30,13 @@ segmentation_filtered_idxs = None  # New: store which masks pass filtering
 segmentation_filtered_idxs_original = None
 segmentation_npz_path = None
 segmentation_display_rect = None
+main_display_rect = None
+segmentation_render_cache = None
+segmentation_render_cache_settings = None
+segmentation_base_rgba_cache = None
 manual_excluded_masks = set()
-metadata_df = pd.DataFrame(columns=["filename", "z_min", "z_max", "rip_cells", "eye", "time_min", "djid", "treatment", "stain"])
+METADATA_COLUMNS = ["filename", "z_min", "z_max", "rip_cells", "eye", "time_min", "djid", "treatment", "stain"]
+metadata_df = pd.DataFrame(columns=METADATA_COLUMNS)
 texture_cache = None
 last_show_masks = True
 last_selected = []
@@ -59,8 +67,6 @@ def _set_dynamic_texture_from_array(rgba, texture_tag="dynamic_texture"):
         raise ValueError("rgba must be HxWx4")
 
     h, w = arr.shape[0], arr.shape[1]
-    print(f"[DEBUG] _set_dynamic_texture_from_array: input shape {h}x{w}, texture={texture_tag}")
-
     # For now, only handle main image texture
     # Segmentation is handled directly in display_segmentation_filtered
     if texture_tag != "dynamic_texture":
@@ -69,27 +75,27 @@ def _set_dynamic_texture_from_array(rgba, texture_tag="dynamic_texture"):
 
     # Main image: scale to fit 1024x512 maintaining aspect ratio
     # Calculate scale to fit within 1024x512
-    scale = min(1024 / w, 512 / h)
+    scale = min(CANVAS_WIDTH / w, CANVAS_HEIGHT / h)
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
-    print(f"[DEBUG] Scaling main image by {scale:.3f}: {new_w}x{new_h}")
     resized = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
     
     # Pad to 1024x512
-    canvas = np.zeros((512, 1024, 4), dtype=np.float32)
-    y_offset = (512 - new_h) // 2
-    x_offset = (1024 - new_w) // 2
+    canvas = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH, 4), dtype=np.float32)
+    y_offset = (CANVAS_HEIGHT - new_h) // 2
+    x_offset = (CANVAS_WIDTH - new_w) // 2
     canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+    global main_display_rect
+    main_display_rect = (x_offset, y_offset, new_w, new_h)
     
     # Flatten and update texture
     flat = canvas.flatten().tolist()
     try:
         dpg.set_value(texture_tag, flat)
-        print(f"[DEBUG] Texture updated successfully")
     except Exception as exc:
         print(f"[WARN] set_value failed: {exc}")
 
-def _fit_rgba_to_canvas(rgba, canvas_w=1024, canvas_h=512):
+def _fit_rgba_to_canvas(rgba, canvas_w=CANVAS_WIDTH, canvas_h=CANVAS_HEIGHT):
     """
     Scale RGBA content to fit inside a fixed canvas while preserving aspect ratio.
     Returns the padded canvas and the drawn rectangle as (x_offset, y_offset, new_w, new_h).
@@ -109,6 +115,111 @@ def _fit_rgba_to_canvas(rgba, canvas_w=1024, canvas_h=512):
     x_offset = (canvas_w - new_w) // 2
     canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
     return canvas, (x_offset, y_offset, new_w, new_h)
+
+def _empty_metadata_df():
+    return pd.DataFrame(columns=METADATA_COLUMNS)
+
+def _metadata_file_path(folder=None):
+    folder = folder or current_folder
+    if not folder:
+        return None
+    folder_name = os.path.basename(folder.rstrip("/\\"))
+    return os.path.join(folder, f"{folder_name}_gui_metadata.json")
+
+def _normalize_rip_cells(value):
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [int(v) for v in value]
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return []
+    return []
+
+def _normalize_metadata_record(record):
+    return {
+        "filename": str(record.get("filename", "")).strip(),
+        "z_min": int(record.get("z_min", 0) or 0),
+        "z_max": int(record.get("z_max", 0) or 0),
+        "rip_cells": _normalize_rip_cells(record.get("rip_cells", [])),
+        "eye": str(record.get("eye", "") or ""),
+        "time_min": int(record.get("time_min", 0) or 0),
+        "djid": str(record.get("djid", "") or ""),
+        "treatment": str(record.get("treatment", "") or ""),
+        "stain": str(record.get("stain", "") or ""),
+    }
+
+def _load_metadata_for_folder(folder=None):
+    global metadata_df
+    path = _metadata_file_path(folder)
+    if not path or not os.path.exists(path):
+        metadata_df = _empty_metadata_df()
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        rows = []
+        if isinstance(payload, list):
+            for record in payload:
+                if isinstance(record, dict):
+                    normalized = _normalize_metadata_record(record)
+                    if normalized["filename"]:
+                        rows.append(normalized)
+        metadata_df = pd.DataFrame(rows, columns=METADATA_COLUMNS) if rows else _empty_metadata_df()
+        print(f"[DEBUG] Loaded {len(metadata_df)} metadata rows from {path}")
+    except Exception as exc:
+        metadata_df = _empty_metadata_df()
+        print(f"[WARN] Failed to load metadata file {path}: {exc}")
+
+def _persist_metadata():
+    path = _metadata_file_path()
+    if not path:
+        return
+
+    rows = []
+    for record in metadata_df.to_dict(orient="records"):
+        normalized = _normalize_metadata_record(record)
+        if normalized["filename"]:
+            rows.append(normalized)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2)
+    print(f"[DEBUG] Saved {len(rows)} metadata rows to {path}")
+
+def _restore_contents_selection():
+    if opened_file is None:
+        return
+    for display_name, real_name in display_map.items():
+        if real_name == opened_file:
+            dpg.set_value("contents_list", display_name)
+            break
+
+def _clear_segmentation_render_cache():
+    global segmentation_render_cache, segmentation_render_cache_settings, segmentation_base_rgba_cache
+    segmentation_render_cache = None
+    segmentation_render_cache_settings = None
+    segmentation_base_rgba_cache = None
+
+def _get_cached_segmentation_render(show_removed, label_filtered_only):
+    global segmentation_render_cache, segmentation_render_cache_settings
+    if segmentation_masks is None:
+        return None
+
+    filtered_key = None if segmentation_filtered_idxs is None else tuple(int(v) for v in segmentation_filtered_idxs)
+    settings = (bool(show_removed), bool(label_filtered_only), filtered_key)
+    if segmentation_render_cache is not None and segmentation_render_cache_settings == settings:
+        return segmentation_render_cache
+
+    import analysis_helpers
+    segmentation_render_cache = analysis_helpers.create_labeled_segmentation_image(
+        segmentation_masks,
+        segmentation_colors,
+        filtered_idxs=segmentation_filtered_idxs,
+        label_min_area=0,
+        force_labels=True,
+        show_removed=show_removed,
+        label_filtered_only=label_filtered_only,
+    )
+    segmentation_render_cache_settings = settings
+    return segmentation_render_cache
 
 def normalize_image_fixed(img):
     return img.astype(np.float32) / 255.0
@@ -190,6 +301,7 @@ def handle_folder_selection(folder):
     global current_folder, opened_file
     current_folder = folder
     opened_file = None
+    _load_metadata_for_folder(folder)
     two_level = f"{os.path.basename(os.path.dirname(folder))}/{os.path.basename(folder)}"
     dpg.set_value("dir_path_repeat", two_level)
     refresh_contents_list()
@@ -218,6 +330,7 @@ def open_folder_dialog(sender, app_data, user_data):
         return
     current_folder = folder
     opened_file = None
+    _load_metadata_for_folder(folder)
     two_level = f"{os.path.basename(os.path.dirname(folder))}\\{os.path.basename(folder)}"
     dpg.set_value("dir_path_repeat", two_level)
     refresh_contents_list()
@@ -247,6 +360,7 @@ def load_segmentation_if_available(filename):
     """
     global segmentation_masks, segmentation_colors, segmentation_filtered_idxs
     global segmentation_filtered_idxs_original, segmentation_npz_path, manual_excluded_masks
+    _clear_segmentation_render_cache()
     
     # Clear any previous segmentation display immediately
     if dpg.does_item_exist("segmentation_window"):
@@ -257,7 +371,7 @@ def load_segmentation_if_available(filename):
     # Clear segmentation texture to blank
     try:
         if dpg.does_item_exist("segmentation_texture"):
-            blank = np.zeros((512, 1024, 4), dtype=np.float32).flatten().tolist()
+            blank = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH, 4), dtype=np.float32).flatten().tolist()
             dpg.set_value("segmentation_texture", blank)
     except Exception:
         pass
@@ -314,29 +428,13 @@ def display_segmentation_filtered():
     """
     Display the loaded segmentation with colors and labels, showing only filtered masks.
     """
-    global segmentation_masks, segmentation_colors, segmentation_filtered_idxs, segmentation_display_rect
-    
-    print(f"[DEBUG] display_segmentation_filtered called")
-    print(f"[DEBUG] segmentation_masks is None: {segmentation_masks is None}")
-    print(f"[DEBUG] segmentation_filtered_idxs: {segmentation_filtered_idxs}")
+    global segmentation_masks, segmentation_colors, segmentation_filtered_idxs
+    global segmentation_display_rect, segmentation_base_rgba_cache
     
     if segmentation_masks is None:
-        print("[DEBUG] No segmentation masks loaded, hiding window")
         if dpg.does_item_exist("segmentation_window"):
             dpg.hide_item("segmentation_window")
         return
-    
-    import analysis_helpers
-    # We'll pass the original masks and filtered idxs to the viz function so it can
-    # optionally render removed masks semi-transparently.
-    filtered_masks = segmentation_masks
-    
-    print(f"[DEBUG] segmentation_colors has {len(segmentation_colors)} colors")
-    if segmentation_colors:
-        color_vals = list(segmentation_colors.values())
-        print(f"[DEBUG] First 3 colors: {color_vals[:3]}")
-        unique_colors = set(color_vals)
-        print(f"[DEBUG] Unique colors: {len(unique_colors)}")
     
     # Read user preference for showing removed masks
     show_removed = dpg.get_value("show_removed_masks") if dpg.does_item_exist("show_removed_masks") else False
@@ -344,26 +442,18 @@ def display_segmentation_filtered():
     overlay_on_image = dpg.get_value("seg_overlay_on_image") if dpg.does_item_exist("seg_overlay_on_image") else False
     overlay_alpha = dpg.get_value("seg_overlay_alpha") if dpg.does_item_exist("seg_overlay_alpha") else 0.45
 
-    # Force labels on ALL masks for comprehensive visibility
-    seg_viz = analysis_helpers.create_labeled_segmentation_image(
-        filtered_masks,
-        segmentation_colors,
-        filtered_idxs=segmentation_filtered_idxs,
-        label_min_area=0,  # Label all masks regardless of size
-        force_labels=True,
-        show_removed=show_removed,
-        label_filtered_only=label_filtered_only,
-    )
-    h, w = seg_viz.shape[:2]
-    print(f"[DEBUG] Segmentation viz shape: {h}x{w}")
+    seg_viz = _get_cached_segmentation_render(show_removed, label_filtered_only)
+    if seg_viz is None:
+        return
 
     if overlay_on_image and gray_img is not None:
-        base = to_8bit(gray_img).astype(np.float32) / 255.0
-        base_rgba = np.zeros((base.shape[0], base.shape[1], 4), dtype=np.float32)
-        base_rgba[..., :3] = base[..., None]
-        base_rgba[..., 3] = 1.0
+        if segmentation_base_rgba_cache is None:
+            base = to_8bit(gray_img).astype(np.float32) / 255.0
+            segmentation_base_rgba_cache = np.zeros((base.shape[0], base.shape[1], 4), dtype=np.float32)
+            segmentation_base_rgba_cache[..., :3] = base[..., None]
+            segmentation_base_rgba_cache[..., 3] = 1.0
         seg_alpha = np.clip(seg_viz[..., 3:4], 0.0, 1.0) * float(np.clip(overlay_alpha, 0.0, 1.0))
-        blended = base_rgba.copy()
+        blended = segmentation_base_rgba_cache.copy()
         blended[..., :3] = (1.0 - seg_alpha) * blended[..., :3] + seg_alpha * seg_viz[..., :3]
         blended[..., 3] = 1.0
         canvas, segmentation_display_rect = _fit_rgba_to_canvas(blended)
@@ -375,11 +465,8 @@ def display_segmentation_filtered():
     try:
         if dpg.does_item_exist("segmentation_texture"):
             dpg.set_value("segmentation_texture", flat)
-            print(f"[DEBUG] Set segmentation_texture value")
         if dpg.does_item_exist("segmentation_window"):
             dpg.show_item("segmentation_window")
-            print(f"[DEBUG] Showed segmentation_window")
-        print(f"[DEBUG] Displayed segmentation visualization")
     except Exception as e:
         print(f"[ERROR] updating segmentation texture: {e}")
         import traceback
@@ -401,14 +488,17 @@ def segmentation_click_callback(sender, app_data, user_data):
     mx, my = dpg.get_mouse_pos(local=False)
     x0, y0 = dpg.get_item_rect_min("segmentation_drawlist")
     ix, iy = int(mx - x0), int(my - y0)
-    if ix < 0 or iy < 0 or ix >= 1024 or iy >= 512:
+    draw_w, draw_h = dpg.get_item_rect_size("segmentation_drawlist")
+    if draw_w <= 0 or draw_h <= 0 or ix < 0 or iy < 0 or ix >= draw_w or iy >= draw_h:
         return
+    tex_x = ix * (CANVAS_WIDTH / float(draw_w))
+    tex_y = iy * (CANVAS_HEIGHT / float(draw_h))
     disp_x, disp_y, disp_w, disp_h = segmentation_display_rect
-    if ix < disp_x or iy < disp_y or ix >= disp_x + disp_w or iy >= disp_y + disp_h:
+    if tex_x < disp_x or tex_y < disp_y or tex_x >= disp_x + disp_w or tex_y >= disp_y + disp_h:
         return
     h, w = segmentation_masks.shape
-    x = int((ix - disp_x) * (w / float(disp_w)))
-    y = int((iy - disp_y) * (h / float(disp_h)))
+    x = int((tex_x - disp_x) * (w / float(disp_w)))
+    y = int((tex_y - disp_y) * (h / float(disp_h)))
     if x < 0 or y < 0 or x >= w or y >= h:
         return
     mask_id = int(segmentation_masks[y, x])
@@ -437,6 +527,7 @@ def apply_manual_filter(sender=None, app_data=None, user_data=None):
         payload["filtered_idxs"] = np.array(new_filtered, dtype=int)
         np.savez(segmentation_npz_path, **payload)
         segmentation_filtered_idxs_original = list(new_filtered)
+        _clear_segmentation_render_cache()
         if dpg.does_item_exist("status_text"):
             dpg.set_value("status_text", "Manual filter saved to segmentation file")
     except Exception as exc:
@@ -448,6 +539,7 @@ def reset_manual_filter(sender=None, app_data=None, user_data=None):
     if segmentation_filtered_idxs_original is not None:
         global segmentation_filtered_idxs
         segmentation_filtered_idxs = list(segmentation_filtered_idxs_original)
+    _clear_segmentation_render_cache()
     display_segmentation_filtered()
 
 def display_segmentation():
@@ -459,16 +551,9 @@ def display_segmentation():
     if segmentation_masks is None:
         return
     
-    import analysis_helpers
-    # Use default labeling behavior (no force labels, small min area)
-    seg_viz = analysis_helpers.create_labeled_segmentation_image(
-        segmentation_masks,
-        segmentation_colors,
-        filtered_idxs=None,
-        label_min_area=5,
-        force_labels=False,
-        show_removed=False,
-    )
+    seg_viz = _get_cached_segmentation_render(show_removed=False, label_filtered_only=False)
+    if seg_viz is None:
+        return
     canvas, segmentation_display_rect = _fit_rgba_to_canvas(seg_viz)
     
     # Update texture directly
@@ -510,13 +595,8 @@ def open_nd2_callback(sender, app_data, user_data):
         selected_masks.clear()
         colors.clear()
         texture_cache = None
+        _clear_segmentation_render_cache()
         
-        # Remove any prior segmentation outputs for this file so we don't show stale results
-        _delete_segmentation_outputs_for_file(sel)
-
-        # Load segmentation if available (will be empty after delete until re-segmented)
-        load_segmentation_if_available(sel)
-
         # Load image data
         path = os.path.join(current_folder, sel)
         with nd2.ND2File(path) as f:
@@ -564,6 +644,9 @@ def open_nd2_callback(sender, app_data, user_data):
         # Update texture view
         update_texture(gray_img, force=True)
 
+        # Load any saved segmentation for this file by default
+        load_segmentation_if_available(sel)
+
         # Rebuild and show UI
         add_z_range_widget("contents_window", channel_zstack.shape[0])
         dpg.show_item("identifiers_group")
@@ -599,11 +682,12 @@ def open_nd2_callback(sender, app_data, user_data):
             dpg.set_value("treatment_combo", row["treatment"])
 
 def z_slider_callback(sender, app_data, user_data):
-    global gray_img
+    global gray_img, segmentation_base_rgba_cache
     if channel_zstack is None:  
         return
     z0, z1 = dpg.get_value("z_min_slider"), dpg.get_value("z_max_slider")
     gray_img = max_proj(channel_zstack[z0:z1+1])
+    segmentation_base_rgba_cache = None
     update_texture(gray_img, force=True)
 
 def rip_checkbox_callback(sender, app_data, user_data):
@@ -654,12 +738,15 @@ def save_metadata_callback(sender, app_data, user_data):
 
     z0 = dpg.get_value("z_min_slider")
     z1 = dpg.get_value("z_max_slider")
+    existing_rip_cells = []
+    if opened_file in metadata_df["filename"].values:
+        existing_rip_cells = metadata_df.loc[metadata_df["filename"] == opened_file, "rip_cells"].iloc[0]
 
     data = {
         "filename": opened_file,
         "z_min": z0,
         "z_max": z1,
-        "rip_cells": [],
+        "rip_cells": _normalize_rip_cells(existing_rip_cells),
         "eye": eye,
         "time_min": time_min,
         "djid": djid,
@@ -673,13 +760,10 @@ def save_metadata_callback(sender, app_data, user_data):
     else:
         metadata_df.loc[len(metadata_df)] = data
 
+    _persist_metadata()
     dpg.set_value("status_text", f"Saved metadata for {opened_file}")
     refresh_contents_list()
-
-    for display_name, real_name in display_map.items():
-        if real_name == opened_file:
-            dpg.set_value("contents_list", display_name)
-            break
+    _restore_contents_selection()
 
     dpg.show_item("rip_group")
 
@@ -693,6 +777,7 @@ def run_rip_detector_callback(sender, app_data, user_data):
     z0 = dpg.get_value("z_min_slider")
     z1 = dpg.get_value("z_max_slider")
     metadata_df.loc[metadata_df["filename"] == opened_file, ["z_min", "z_max"]] = [z0, z1]
+    _persist_metadata()
 
     mask_array = None
     selected_masks.clear()
@@ -775,14 +860,24 @@ def update_texture(base_img=None, force=False):
 def mask_click_callback(sender, app_data, user_data):
     if not dpg.get_value("show_masks_checkbox"):
         return
-    if mask_array is None or mask_array.max() == 0:
+    if mask_array is None or mask_array.max() == 0 or gray_img is None or main_display_rect is None:
         return
     mx, my = dpg.get_mouse_pos(local=False)
     x0, y0 = dpg.get_item_rect_min("drawlist")
     ix, iy = int(mx - x0), int(my - y0)
-    if ix < 0 or iy < 0 or ix >= gray_img.shape[1] or iy >= gray_img.shape[0]:
+    draw_w, draw_h = dpg.get_item_rect_size("drawlist")
+    if draw_w <= 0 or draw_h <= 0 or ix < 0 or iy < 0 or ix >= draw_w or iy >= draw_h:
         return
-    m = int(mask_array[iy, ix])
+    tex_x = ix * (CANVAS_WIDTH / float(draw_w))
+    tex_y = iy * (CANVAS_HEIGHT / float(draw_h))
+    disp_x, disp_y, disp_w, disp_h = main_display_rect
+    if tex_x < disp_x or tex_y < disp_y or tex_x >= disp_x + disp_w or tex_y >= disp_y + disp_h:
+        return
+    img_x = int((tex_x - disp_x) * (gray_img.shape[1] / float(disp_w)))
+    img_y = int((tex_y - disp_y) * (gray_img.shape[0] / float(disp_h)))
+    if img_x < 0 or img_y < 0 or img_x >= gray_img.shape[1] or img_y >= gray_img.shape[0]:
+        return
+    m = int(mask_array[img_y, img_x])
     if m > 0:
         if m in selected_masks:
             selected_masks.remove(m)
@@ -813,5 +908,8 @@ def confirm_mask_selection_callback(sender, app_data, user_data):
     if opened_file in metadata_df["filename"].values:
         idx = metadata_df["filename"] == opened_file
         metadata_df.at[metadata_df.index[idx][0], "rip_cells"] = selected_masks.copy()
+        _persist_metadata()
+        refresh_contents_list()
+        _restore_contents_selection()
         dpg.set_value("selected_mask_count", f"Cells in rip: {sorted(selected_masks)}")
         dpg.set_value("status_text", f"Masks confirmed for {opened_file}")
