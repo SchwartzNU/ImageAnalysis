@@ -9,7 +9,7 @@ import warnings
 from skimage import exposure, measure
 from scipy.ndimage import center_of_mass, sum as nd_sum
 from scipy.stats import skew
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, peak_widths
 from skimage.measure import label, regionprops
 from cellpose import models, denoise
 import GUI_helpers
@@ -17,6 +17,18 @@ import GUI_helpers
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 trace_data_df = None
+
+def suppress_cellpose_torch_futurewarning():
+    # Cellpose currently triggers a torch.load FutureWarning internally when
+    # loading trusted local model files. Filter just that known third-party
+    # warning so the GUI logs stay readable.
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=r".*weights_only=False.*",
+    )
+
+suppress_cellpose_torch_futurewarning()
 
 def assign_colors_to_masks(mask_array):
     """
@@ -465,7 +477,7 @@ def square_mask(mask, perc_increase: int = 40):
         new_mask[top:bottom, left:right] = 1
     return new_mask
 
-def get_sq_stacks(image, single_mask):
+def get_sq_stacks(image, single_mask, channel_indices):
     sq_maski = square_mask(single_mask)
 
     props = regionprops(sq_maski.astype(int))
@@ -481,12 +493,13 @@ def get_sq_stacks(image, single_mask):
     max_row = min(y_max, max_row)
     max_col = min(x_max, max_col)
 
-    sq_DAPI_stack = image[:, 0, min_row:max_row, min_col:max_col]
-    sq_eGFP_stack = image[:, 1, min_row:max_row, min_col:max_col]
-    sq_WGA_stack = image[:, 2, min_row:max_row, min_col:max_col]
-    sq_GLUT1_stack = image[:, 3, min_row:max_row, min_col:max_col]
-
-    sq_stacks = np.stack((sq_DAPI_stack, sq_eGFP_stack, sq_WGA_stack, sq_GLUT1_stack))
+    sq_stacks = {
+        "DAPI": image[:, channel_indices["dapi"], min_row:max_row, min_col:max_col],
+        "WGA": image[:, channel_indices["wga"], min_row:max_row, min_col:max_col],
+        "Stain": image[:, channel_indices["stain"], min_row:max_row, min_col:max_col],
+    }
+    if channel_indices.get("egfp") is not None:
+        sq_stacks["eGFP"] = image[:, channel_indices["egfp"], min_row:max_row, min_col:max_col]
 
     return sq_stacks
 
@@ -502,8 +515,9 @@ def nucleus_com(single_channel, mask):
     return com_3d
 
 
-def extract_square_proj_expand(image, single_mask, extra_pixels = 50):
-    DAPI_stack, WGA_stack = image[:, 0, :, :], image[:, 2, :, :]
+def extract_square_proj_expand(image, single_mask, channel_indices, extra_pixels = 50):
+    DAPI_stack = image[:, channel_indices["dapi"], :, :]
+    WGA_stack = image[:, channel_indices["wga"], :, :]
 
     _, _, comzi = nucleus_com(DAPI_stack, single_mask)  # Gets the nucleus stack of the middle of the cell
 
@@ -588,6 +602,12 @@ def get_traces(stacks, mask):
         return np.array(ch_traces)
     return np.array([])
 
+def get_peak_trace_index(stack, mask):
+    trace = get_traces(np.expand_dims(stack, axis=0), mask)
+    if trace.size == 0 or not np.any(np.isfinite(trace)):
+        return None
+    return int(np.nanargmax(trace))
+
 def nuclei_centers_of_mass(stack, masks):
     ids = np.unique(masks)
     ids = ids[ids != 0]
@@ -635,10 +655,10 @@ def remove_outliers_local(centers_of_mass, num_closest_points=20, z_threshold=2)
             filtered_indices.append(i)
     return filtered_data, filtered_indices
 
-def organize_data(mask_id, z_sep, stack_depth, metadata_row, filename):
+def organize_data(mask_id, z_sep, stack_depth, metadata_row, filename, include_egfp=True):
     x_vals = ",".join(map(str, np.array(range(stack_depth)) * z_sep))
 
-    return pd.DataFrame({
+    data = {
         "mask_id": [mask_id],
         "Slice_Seperation": z_sep,
         "X_vals": [x_vals],
@@ -648,14 +668,66 @@ def organize_data(mask_id, z_sep, stack_depth, metadata_row, filename):
         "Treatment": [metadata_row.get("treatment", "")],
         "Stain": [metadata_row.get("stain", "")],
         "Time_Min": [metadata_row.get("time_min", "")],
-        "eGFP_Value": [False],
-        "eGFP_Raw_Intensity": [0.0],
+        "Segmented_Cell_Area_um2": [np.nan],
+        "Segmented_Cell_Equivalent_Diameter_um": [np.nan],
+        "Segmented_Cell_Roundness": [np.nan],
+        "Stain_Middle_Mean": [np.nan],
         "in_rip": [False]
-    })
+    }
+    if include_egfp:
+        data["eGFP_Value"] = [False]
+        data["eGFP_Raw_Intensity"] = [0.0]
+    return pd.DataFrame(data)
 
 def normalize(array):
     array = np.array(array)
     return (array - array.min()) / (array.max() - array.min())
+
+def compute_mask_roundness(mask):
+    mask_uint8 = (mask > 0).astype(np.uint8)
+    if not np.any(mask_uint8):
+        return np.nan
+
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.nan
+
+    contour = max(contours, key=cv2.contourArea)
+    area = float(np.count_nonzero(mask_uint8))
+    perimeter = float(cv2.arcLength(contour, True))
+    if perimeter <= 0 or area <= 0:
+        return np.nan
+    return float((4.0 * np.pi * area) / (perimeter ** 2))
+
+def save_roundness_distribution_plot(dataframe, output_path):
+    if "Segmented_Cell_Roundness" not in dataframe.columns:
+        return
+
+    roundness_vals = pd.to_numeric(dataframe["Segmented_Cell_Roundness"], errors="coerce").dropna()
+    if roundness_vals.empty:
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bins = np.linspace(0.0, 1.05, 31)
+    ax.hist(roundness_vals, bins=bins, color="#4C72B0", edgecolor="white")
+    ax.set_title("Segmented Cell Roundness Distribution")
+    ax.set_xlabel("Roundness (4πA / P²)")
+    ax.set_ylabel("Cell count")
+    ax.set_xlim(0.0, 1.05)
+
+    median_val = float(np.median(roundness_vals))
+    q1, q3 = np.percentile(roundness_vals, [25, 75])
+    ax.axvline(median_val, color="#C44E52", linestyle="--", linewidth=1.5, label=f"Median = {median_val:.3f}")
+    ax.axvline(q1, color="#55A868", linestyle=":", linewidth=1.2, label=f"Q1 = {q1:.3f}")
+    ax.axvline(q3, color="#8172B3", linestyle=":", linewidth=1.2, label=f"Q3 = {q3:.3f}")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
 
 def segment_images():
     """
@@ -675,13 +747,7 @@ def segment_images():
     segmentation_dir = os.path.join(GUI_helpers.current_folder, f"{folder_name}_segmentation")
     os.makedirs(segmentation_dir, exist_ok=True)
 
-    # Suppress torch.load FutureWarning emitted by cellpose internals
-    warnings.filterwarnings(
-        "ignore",
-        category=FutureWarning,
-        message=r".*weights_only=False.*",
-        module=r"cellpose.*",
-    )
+    suppress_cellpose_torch_futurewarning()
 
     recompute_existing = dpg.get_value("recompute_segmentation") if dpg.does_item_exist("recompute_segmentation") else False
     dapi_model = None
@@ -778,7 +844,6 @@ def extract_traces():
         return
 
     global trace_data_df
-    print('extract traces')
 
     dpg.configure_item("extract_traces_button", enabled=False)
     dpg.set_value("trace_file_status", "File: Starting trace extraction...")
@@ -794,10 +859,11 @@ def extract_traces():
         return
 
     results = []
+    small_diameter_filtered = 0
+    low_roundness_filtered = 0
 
     model_path_wga = os.path.join(ROOT_DIR, 'CP_models', 'T5_WGA_V2')
     wga_model = models.CellposeModel(gpu=True, pretrained_model=model_path_wga)
-    print('done loading models')
 
     for idx, row in GUI_helpers.metadata_df.iterrows():
         filename = row.get("filename")
@@ -828,16 +894,18 @@ def extract_traces():
         z_max = int(seg_data['z_max'])
 
         with nd2.ND2File(file_path) as f:
-            z_sep = f.voxel_size().z
+            voxel_size = f.voxel_size()
+            z_sep = voxel_size.z
+            x_sep = getattr(voxel_size, "x", np.nan)
+            y_sep = getattr(voxel_size, "y", np.nan)
             stack = to_8bit(f.asarray())
-        dapi_stack = stack[z_min:z_max+1, 0, :, :]
+        channel_indices = GUI_helpers.get_image_channel_indices(stack.shape[1])
+        include_egfp = channel_indices.get("egfp") is not None
+        dapi_stack = stack[z_min:z_max+1, channel_indices["dapi"], :, :]
 
         dpg.set_value("trace_file_status", f"File: {filename}")
-        print('Found file', z_sep)
 
         mask_ids = np.delete(np.unique(dapi_masks), 0) - 1
-
-        print('Found masks', mask_ids)
 
         for i in mask_ids:
             if i not in filtered_idxs:
@@ -846,14 +914,12 @@ def extract_traces():
             dpg.set_value("trace_status_text", f"Extracting mask {i} of {len(mask_ids)}")
 
             single_mask = extract_masks(dapi_masks, i, reset_mask_ids=False)
-            print('single mask', np.unique(single_mask))
             diam = get_mask_diameter(single_mask)
             expansion = 50
 
-            sq_stacks = get_sq_stacks(stack, single_mask)
-            print('Passed sq_stacks', i, single_mask.shape)
+            sq_stacks = get_sq_stacks(stack, single_mask, channel_indices)
 
-            expanded_sq, z_level = extract_square_proj_expand(stack, single_mask, expansion)
+            expanded_sq, z_level = extract_square_proj_expand(stack, single_mask, channel_indices, expansion)
 
             expanded_mask, _, _ = wga_model.eval(expanded_sq, diameter=diam, channels=[0, 0])
             cleaned_mask = remove_boundary(expanded_mask, expansion)
@@ -864,13 +930,38 @@ def extract_traces():
                 cleaned_mask = closest_mask_2d(single_mask, cleaned_mask)
 
             file_base = row["filename"] if pd.notnull(row["filename"]) else ""
-            cell_data = organize_data(i, z_sep, stack.shape[0], row, file_base)
+            cell_data = organize_data(i, z_sep, stack.shape[0], row, file_base, include_egfp=include_egfp)
+            cell_area_px = float(np.count_nonzero(cleaned_mask))
+            pixel_area_um2 = float(x_sep) * float(y_sep) if np.isfinite(x_sep) and np.isfinite(y_sep) else np.nan
+            cell_area_um2 = cell_area_px * pixel_area_um2 if np.isfinite(pixel_area_um2) else np.nan
+            cell_eq_diameter_um = float(np.sqrt((4.0 * cell_area_um2) / np.pi)) if np.isfinite(cell_area_um2) and cell_area_um2 > 0 else np.nan
+            if np.isfinite(cell_eq_diameter_um) and cell_eq_diameter_um < 5.0:
+                small_diameter_filtered += 1
+                continue
+            cell_roundness = compute_mask_roundness(cleaned_mask)
+            if np.isfinite(cell_roundness) and cell_roundness < 0.55:
+                low_roundness_filtered += 1
+                continue
+            cell_data["Segmented_Cell_Area_um2"] = cell_area_um2
+            cell_data["Segmented_Cell_Equivalent_Diameter_um"] = cell_eq_diameter_um
+            cell_data["Segmented_Cell_Roundness"] = cell_roundness
 
-            for ch_idx, ch_name in zip(range(min(stack.shape[1], 4)), ['DAPI', 'eGFP', 'WGA', 'GLUT1']):
-                trace = get_traces(np.expand_dims(sq_stacks[ch_idx], axis=0), cleaned_mask)
+            if cell_area_px > 0:
+                largest_slice_idx = get_peak_trace_index(sq_stacks["WGA"], cleaned_mask)
+                if largest_slice_idx is not None:
+                    middle_slice = sq_stacks["Stain"][largest_slice_idx]
+                    cell_data["Stain_Middle_Mean"] = float(np.mean(middle_slice[cleaned_mask.astype(bool)]))
+
+            channel_order = ["DAPI"]
+            if include_egfp:
+                channel_order.append("eGFP")
+            channel_order.extend(["WGA", "Stain"])
+
+            for ch_name in channel_order:
+                trace = get_traces(np.expand_dims(sq_stacks[ch_name], axis=0), cleaned_mask)
                 cell_data[f"Y_vals_{ch_name}"] = [trace] * len(cell_data)
                 if ch_name == 'eGFP':
-                    eGFP_sum = np.sum(sq_stacks[1][z_level][cleaned_mask.astype(bool)])
+                    eGFP_sum = np.sum(sq_stacks["eGFP"][z_level][cleaned_mask.astype(bool)])
                     cell_data['eGFP_Raw_Intensity'] = eGFP_sum / np.sum(cleaned_mask)
 
             rip_ids = row.get("rip_cells", [])
@@ -882,7 +973,7 @@ def extract_traces():
 
     if results:
         trace_data_df = pd.concat(results, ignore_index=True)
-        if "eGFP_Raw_Intensity" in trace_data_df:
+        if "eGFP_Raw_Intensity" in trace_data_df.columns:
             egfp_vals = trace_data_df["eGFP_Raw_Intensity"].values
             normalized_vals = normalize(egfp_vals)
             trace_data_df["eGFP_Value"] = normalized_vals > 0.2
@@ -893,6 +984,13 @@ def extract_traces():
         # Define folder_name once at the top level
         folder_name = os.path.basename(GUI_helpers.current_folder.rstrip("/\\"))
         processed_path = os.path.join(GUI_helpers.current_folder, f"{folder_name}_processed.csv")
+        roundness_plot_path = os.path.join(GUI_helpers.current_folder, f"{folder_name}_roundness_distribution.png")
+        save_roundness_distribution_plot(trace_data_df, roundness_plot_path)
+        print(f"Saved roundness distribution plot to: {roundness_plot_path}")
+        roundness_vals = pd.to_numeric(trace_data_df["Segmented_Cell_Roundness"], errors="coerce").dropna()
+        if not roundness_vals.empty:
+            q1, median, q3 = np.percentile(roundness_vals, [25, 50, 75])
+            print(f"Roundness quartiles: Q1={q1:.3f}, median={median:.3f}, Q3={q3:.3f}")
 
         if dpg.get_value("opt_save_metadata"):
             csv_path = os.path.join(GUI_helpers.current_folder, f"{folder_name}_raw.csv")
@@ -909,14 +1007,17 @@ def extract_traces():
             processed_df = run_integral_analysis(trace_data_df)
 
             ## Post processing 
-            drop_cols = ['X_vals', 'Y_vals_DAPI', 'Y_vals_eGFP','Y_vals_WGA', 'Y_vals_GLUT1',
+            drop_cols = ['X_vals', 'Y_vals_DAPI', 'Y_vals_WGA', 'Y_vals_Stain',
+                        'Stain_Mean_Intensity',
                         'Cell','WGA_Middle_Indices', 'DAPI_peak_index',
                         'WGA_Top_Indices','WGA_Bottom_Indices',]
+            if 'Y_vals_eGFP' in processed_df.columns:
+                drop_cols.append('Y_vals_eGFP')
 
             rename_cols = {'Treatment':'Experimental_Condition', 'in_rip':'In_Rip',
                             'Time_Min': 'Time_Condition', 'Length':'Length_um'}
 
-            processed_df.drop(columns= drop_cols, axis = 1, inplace = True)
+            processed_df.drop(columns=[c for c in drop_cols if c in processed_df.columns], axis = 1, inplace = True)
             processed_df.rename(columns =  rename_cols, inplace = True)
             ##
 
@@ -925,6 +1026,10 @@ def extract_traces():
             
     dpg.set_value("trace_file_status", "File: Done")
     dpg.set_value("trace_status_text", f"Status: Saved to {processed_path}")
+    if small_diameter_filtered:
+        print(f"Filtered out {small_diameter_filtered} cells with equivalent diameter < 5 um")
+    if low_roundness_filtered:
+        print(f"Filtered out {low_roundness_filtered} cells with roundness < 0.55")
     dpg.configure_item("extract_traces_button", enabled=True)
     
     # Save filtered segmentation visualization (cells removed shown in gray)
@@ -950,37 +1055,67 @@ def extract_traces():
 def run_integral_analysis(trace_data_df):
     df = trace_data_df.copy()
 
-    print(f"[DEBUG] Starting analysis with {len(df)} rows")
+    if "Stain_Middle_Mean" not in df.columns:
+        df["Stain_Middle_Mean"] = np.nan
+    else:
+        missing_middle = pd.to_numeric(df["Stain_Middle_Mean"], errors="coerce").isna()
+        df.loc[missing_middle, "Stain_Middle_Mean"] = np.nan
+
+    def infer_stain_middle_from_traces(row):
+        y_stain = row.get("Y_vals_Stain", [])
+        y_wga = row.get("Y_vals_WGA", [])
+        try:
+            y_stain = np.asarray(y_stain, dtype=float)
+            y_wga = np.asarray(y_wga, dtype=float)
+        except Exception:
+            return np.nan
+        if y_stain.size == 0 or y_wga.size == 0:
+            return np.nan
+        if y_stain.size != y_wga.size or not np.any(np.isfinite(y_wga)):
+            return np.nan
+        idx = int(np.nanargmax(y_wga))
+        if idx < 0 or idx >= y_stain.size:
+            return np.nan
+        return float(y_stain[idx])
+
+    missing_middle = pd.to_numeric(df["Stain_Middle_Mean"], errors="coerce").isna()
+    if missing_middle.any():
+        df.loc[missing_middle, "Stain_Middle_Mean"] = df.loc[missing_middle].apply(infer_stain_middle_from_traces, axis=1)
 
     # Add separation and cell identity
     df["Cell"] = df["file_name"].astype(str) + "_mask" + df["Segmentation_Mask_ID"].astype(str)
 
     # Peak detection
     df = WGA_Peaks_Finder_V2(df)
-    print(f"[DEBUG] After WGA_Peaks_Finder_V2: {len(df)} rows")
-    print("[DEBUG] Sample DAPI_peak_index values:")
-    print(df["DAPI_peak_index"].head(10))
-    print(df["DAPI_peak_index"].apply(type).value_counts())
-
 
     df = filter_out_unclear_DAPI(df)
-    print(f"[DEBUG] After filter_out_unclear_DAPI: {len(df)} rows")
 
     if len(df) == 0:
         print("[ERROR] No valid cells remaining after DAPI filtering.")
         return df
 
-    # Integrals
-    df = Top_Bottom_Indices_V2(df)
-    df = TopMidBot_Integrals_V2(df)
-    df = Surface_Integrals_V2(df)
+    # Profile means
+    df = Middle_Means_V2(df)
+    df = Surface_Means_V2(df)
 
     df = Replace_NaNs_With_None(df)
-
-    print(f"[DEBUG] Final dataframe shape: {df.shape}")
     return df
 
-def WGA_Peaks_Finder_V2(dataframe, prom_val: float = 1.0):
+def smooth_profile(y_vals, sep, window_um=0.4):
+    y_vals = np.asarray(y_vals, dtype=float)
+    if y_vals.size == 0 or not np.isfinite(sep) or sep <= 0 or window_um <= 0:
+        return y_vals
+
+    window_pts = max(int(round(window_um / sep)), 1)
+    if window_pts % 2 == 0:
+        window_pts += 1
+    if window_pts <= 1:
+        return y_vals
+
+    kernel = np.ones(window_pts, dtype=float) / float(window_pts)
+    return np.convolve(y_vals, kernel, mode="same")
+
+def WGA_Peaks_Finder_V2(dataframe, prom_val: float = 1.0, wga_prom_val: float = 0.75, wga_smooth_um: float = 0.4):
     """
     Identifies WGA peaks before and after a single DAPI peak for each row.
     Adds:
@@ -995,33 +1130,34 @@ def WGA_Peaks_Finder_V2(dataframe, prom_val: float = 1.0):
     cell_ids = []
 
     for idx, row in dataframe.iterrows():
-        y_wga = row.get("Y_vals_WGA", [])
-        y_dapi = row.get("Y_vals_DAPI", [])
+        y_wga = np.asarray(row.get("Y_vals_WGA", []), dtype=float)
+        y_dapi = np.asarray(row.get("Y_vals_DAPI", []), dtype=float)
         sep = row.get("Slice_Seperation", np.nan)
+        if not np.isfinite(sep) or sep <= 0:
+            wga_middle.append([np.nan, np.nan])
+            dapi_peaks.append(np.nan)
+            lengths.append(np.nan)
+            cell_ids.append(idx)
+            continue
 
-        print(f"[DEBUG] Cell index: {idx}")
-        print(f"[DEBUG] y_wga type: {type(y_wga)}, len: {len(y_wga) if hasattr(y_wga, '__len__') else 'N/A'}")
-        print(f"[DEBUG] y_dapi type: {type(y_dapi)}, len: {len(y_dapi) if hasattr(y_dapi, '__len__') else 'N/A'}")
-        print(f"[DEBUG] sep: {sep}")
-
-        dapi_dist = int(12 / sep)
-        wga_dist = int(1.05 / sep)
+        dapi_dist = max(int(12 / sep), 1)
+        wga_dist = max(int(1.05 / sep), 1)
 
         dapi_indices, _ = find_peaks(y_dapi, prominence=prom_val, distance=dapi_dist)
-        print('DEBUG', dapi_indices)
-        wga_indices, _ = find_peaks(y_wga, prominence=prom_val, distance=wga_dist)
+        y_wga_smoothed = smooth_profile(y_wga, sep, window_um=wga_smooth_um)
+        wga_indices, _ = find_peaks(y_wga_smoothed, prominence=wga_prom_val, distance=wga_dist)
 
         peak_before = np.nan
         peak_after = np.nan
 
         if len(dapi_indices) == 1:
             dapi_idx = dapi_indices[0]
-            for peak in wga_indices:
-                if peak < dapi_idx:
-                    peak_before = peak
-                elif peak > dapi_idx and np.isnan(peak_after):
-                    peak_after = peak
-                    break
+            before_candidates = wga_indices[wga_indices < dapi_idx]
+            after_candidates = wga_indices[wga_indices > dapi_idx]
+            if len(before_candidates) > 0:
+                peak_before = int(before_candidates[-1])
+            if len(after_candidates) > 0:
+                peak_after = int(after_candidates[0])
         else:
             dapi_idx = np.nan
 
@@ -1055,41 +1191,12 @@ def filter_out_unclear_DAPI(dataframe):
 
     return valid_rows.reset_index(drop=True)
 
-def Top_Bottom_Indices_V2(dataframe, microns_extension: float = 1.5):
-    '''
-    Calculates WGA_Top_Indices and WGA_Bottom_Indices based on Slice_Seperation and WGA_Middle_Indices.
-    '''
-    grouped = dataframe.groupby('Cell')
-    slice_separation = grouped['Slice_Seperation'].first()
-    first_peaks = grouped['WGA_Middle_Indices'].apply(lambda x: x.iloc[0] if len(x) > 0 else [np.nan, np.nan])
-
-    index_offset = (microns_extension / slice_separation).fillna(0).astype(int)
-
-    l_middle = first_peaks.apply(lambda x: x[0] if len(x) > 0 else np.nan)
-    r_middle = first_peaks.apply(lambda x: x[1] if len(x) > 1 else np.nan)
-
-    l_top = np.maximum(l_middle - index_offset, 0)
-    r_bot = r_middle + index_offset
-
-    r_middle = r_middle.apply(lambda x: None if pd.isna(x) else x)
-    r_bot = r_bot.apply(lambda x: None if pd.isna(x) else x)
-
-    idx_df = pd.DataFrame({
-        'Cell': grouped.size().index,
-        'WGA_Top_Indices': list(zip(l_top, l_middle)),
-        'WGA_Bottom_Indices': list(zip(r_middle, r_bot))
-    })
-
-    dataframe["WGA_Top_Indices"] = list(zip(l_top, l_middle))
-    dataframe["WGA_Bottom_Indices"] = list(zip(r_middle, r_bot))
-    return dataframe
-
-def TopMidBot_Integrals_V2(dataframe):
+def Middle_Means_V2(dataframe):
     """
-    Calculates WGA Top, Middle, Bottom integrals using defined index pairs.
-    Adds columns: WGA_Top_Integral, WGA_Middle_Integral, WGA_Bottom_Integral
+    Calculates the WGA mean for the middle region between the two WGA peaks.
+    Stain_Middle_Mean is expected to be precomputed from the inferred largest cell slice.
     """
-    def integral_calculator(y_vals, indices):
+    def mean_calculator(y_vals, indices):
         if not isinstance(indices, (list, tuple)) or pd.isna(indices[0]) or pd.isna(indices[1]):
             return None
         try:
@@ -1098,49 +1205,78 @@ def TopMidBot_Integrals_V2(dataframe):
             end_idx = min(end_idx, len(y_vals))
             if start_idx >= end_idx:
                 return None
-            return float(np.sum(np.array(y_vals)[start_idx:end_idx]))
-        except:
+            segment = np.asarray(y_vals)[start_idx:end_idx]
+            if segment.size == 0:
+                return None
+            return float(np.mean(segment))
+        except Exception:
             return None
 
-    for section in ['Middle', 'Top', 'Bottom']:
-        WGA_col_name = f"WGA_{section}_Integral"
-        WGA_index_col = f"WGA_{section}_Indices"
-        dataframe[WGA_col_name] = dataframe.apply(lambda row: integral_calculator(row.get('Y_vals_WGA', []),
-                                                                              row.get(WGA_index_col)), axis=1)
-        GLUT1_col_name = f"GLUT1_{section}_Integral"
-        dataframe[GLUT1_col_name] = dataframe.apply(lambda row: integral_calculator(row.get('Y_vals_GLUT1', []),
-                                                                              row.get(WGA_index_col)), axis=1)
+    dataframe["WGA_Middle_Mean"] = dataframe.apply(
+        lambda row: mean_calculator(row.get("Y_vals_WGA", []), row.get("WGA_Middle_Indices")),
+        axis=1
+    )
     return dataframe
 
-def Surface_Integrals_V2(dataframe):
+def Surface_Means_V2(dataframe):
     def compute_surface(row):
         peak_indices = row.get("WGA_Middle_Indices", [np.nan, np.nan])
-        x_vals = row.get("X_vals", [])
-        y_G = row.get("Y_vals_GLUT1", [])
+        y_G = row.get("Y_vals_Stain", [])
         y_W = row.get("Y_vals_WGA", [])
-        sep = row.get("Slice_Seperation", None)
-        idx_offset = int(1.5 / sep) if sep else 3
+        sep = row.get("Slice_Seperation", np.nan)
+        y_W_arr = np.asarray(y_W, dtype=float)
+        y_G_arr = np.asarray(y_G, dtype=float)
+        y_W_smoothed = smooth_profile(y_W_arr, sep, window_um=0.4)
 
-        def get_integral(idx, y_vals):
+        def get_window_bounds(idx):
             if pd.isna(idx):
-                return np.nan
+                return (None, None, np.nan)
             idx = int(idx)
-            left = max(idx - idx_offset, 0)
-            right = min(idx + idx_offset, len(x_vals))
-            return np.sum(y_vals[left:right])
+            try:
+                widths, _, left_ips, right_ips = peak_widths(y_W_smoothed, [idx], rel_height=0.5)
+            except Exception:
+                return (None, None, np.nan)
+            if len(widths) == 0:
+                return (None, None, np.nan)
 
-        top_G = get_integral(peak_indices[0], y_G)
-        bot_G = get_integral(peak_indices[1], y_G)
-        top_W = get_integral(peak_indices[0], y_W)
-        bot_W = get_integral(peak_indices[1], y_W)
+            left = max(int(np.floor(left_ips[0])), 0)
+            right = min(int(np.ceil(right_ips[0])), len(y_W_smoothed))
+            if right <= left:
+                right = min(left + 1, len(y_W_arr))
+            width_um = float(widths[0] * sep) if pd.notna(sep) and sep != 0 else np.nan
+            return (left, right, width_um)
+
+        def get_mean(bounds, y_vals):
+            left, right, _ = bounds
+            if left is None or right is None:
+                return np.nan
+            segment = np.asarray(y_vals[left:right], dtype=float)
+            if segment.size == 0:
+                return np.nan
+            return float(np.mean(segment))
+
+        top_bounds = get_window_bounds(peak_indices[0])
+        bot_bounds = get_window_bounds(peak_indices[1])
+        top_G = get_mean(top_bounds, y_G_arr)
+        bot_G = get_mean(bot_bounds, y_G_arr)
+        top_W = get_mean(top_bounds, y_W_arr)
+        bot_W = get_mean(bot_bounds, y_W_arr)
+        mid_stain = row.get("Stain_Middle_Mean", np.nan)
 
         return pd.Series({
-            "GLUT1_Top_Surface_Integral": top_G,
-            "GLUT1_Bot_Surface_Integral": bot_G,
-            "WGA_Top_Surface_Integral": top_W,
-            "WGA_Bot_Surface_Integral": bot_W,
+            "Stain_Top_Surface_Mean": top_G,
+            "Stain_Bot_Surface_Mean": bot_G,
+            "WGA_Top_Surface_Mean": top_W,
+            "WGA_Bot_Surface_Mean": bot_W,
+            "WGA_Top_Surface_Width_um": top_bounds[2],
+            "WGA_Bot_Surface_Width_um": bot_bounds[2],
             "Top_Surface_Ratio": top_G / top_W if not pd.isna(top_G) and not pd.isna(top_W) and top_W != 0 else np.nan,
             "Bot_Surface_Ratio": bot_G / bot_W if not pd.isna(bot_G) and not pd.isna(bot_W) and bot_W != 0 else np.nan,
+            "Stain_Top_Surface_To_Stain_Middle_Ratio": (
+                top_G / mid_stain
+                if not pd.isna(top_G) and not pd.isna(mid_stain) and mid_stain != 0
+                else np.nan
+            ),
         })
     
     surface_df = dataframe.apply(compute_surface, axis=1)

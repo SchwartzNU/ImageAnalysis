@@ -1,5 +1,6 @@
 import os
 import json
+import warnings
 import numpy as np
 import pandas as pd
 import tkinter as tk
@@ -15,6 +16,18 @@ from fdialog import FileDialog
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CANVAS_WIDTH = 1024
 CANVAS_HEIGHT = 512
+
+def suppress_cellpose_torch_futurewarning():
+    # Cellpose currently triggers a torch.load FutureWarning internally when
+    # loading trusted local model files. Filter just that known third-party
+    # warning so the GUI logs stay readable.
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=r".*weights_only=False.*",
+    )
+
+suppress_cellpose_torch_futurewarning()
 
 current_folder = None
 opened_file = None
@@ -54,6 +67,30 @@ def to_8bit(arr):
     else:
         norm = norm * 0.0
     return img_as_ubyte(norm)
+
+def has_gfp_channel_enabled():
+    return dpg.get_value("has_gfp_channel") if dpg.does_item_exist("has_gfp_channel") else True
+
+def get_image_channel_indices(num_channels):
+    use_gfp = has_gfp_channel_enabled() and num_channels >= 4
+    if use_gfp:
+        return {"dapi": 0, "egfp": 1, "wga": 2, "stain": 3}
+    if num_channels >= 3:
+        return {"dapi": 0, "egfp": None, "wga": 1, "stain": 2}
+    raise ValueError(f"Expected at least 3 channels, found {num_channels}")
+
+def gfp_channel_toggle_callback(sender=None, app_data=None, user_data=None):
+    global opened_file
+    if opened_file is None or not dpg.does_item_exist("contents_list"):
+        return
+
+    current_file = opened_file
+    for display_name, real_name in display_map.items():
+        if real_name == current_file:
+            dpg.set_value("contents_list", display_name)
+            break
+    opened_file = None
+    open_nd2_callback(sender, app_data, user_data)
 
 def _set_dynamic_texture_from_array(rgba, texture_tag="dynamic_texture"):
     """
@@ -601,8 +638,9 @@ def open_nd2_callback(sender, app_data, user_data):
         path = os.path.join(current_folder, sel)
         with nd2.ND2File(path) as f:
             stack8 = to_8bit(f.asarray())
-        channel_zstack = stack8[:, 0, :, :]
-        channel2_stack = stack8[:, 2, :, :]
+        channel_indices = get_image_channel_indices(stack8.shape[1])
+        channel_zstack = stack8[:, channel_indices["dapi"], :, :]
+        channel2_stack = stack8[:, channel_indices["wga"], :, :]
         gray_img = max_proj(channel_zstack)
         opened_file = sel
         dpg.set_value("contents_list", sel)
@@ -811,14 +849,14 @@ def run_rip_detector_callback(sender, app_data, user_data):
     dpg.set_value("status_text", "Rip detection complete")
 
 def wga_view_callback(sender, app_data, user_data):
-    img = gray_img if not dpg.get_value("wga_checkbox") else channel2_stack[dpg.get_value("wga_slider")]
+    img = gray_img if not dpg.get_value("wga_checkbox") or channel2_stack is None else channel2_stack[dpg.get_value("wga_slider")]
     update_texture(img, force=True)
 
 def update_texture(base_img=None, force=False):
     global gray_img, channel2_stack, texture_cache, last_show_masks, last_selected, mask_array, selected_masks, colors
     print("\n[DEBUG] update_texture called")
     if base_img is None:
-        base_img = gray_img if not dpg.get_value("wga_checkbox") else channel2_stack[dpg.get_value("wga_slider")]
+        base_img = gray_img if not dpg.get_value("wga_checkbox") or channel2_stack is None else channel2_stack[dpg.get_value("wga_slider")]
 
     show_masks = dpg.get_value("show_masks_checkbox")
     if not force and texture_cache is not None and show_masks == last_show_masks and selected_masks == last_selected:

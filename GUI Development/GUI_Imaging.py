@@ -58,6 +58,7 @@ dpg.create_viewport(title='GUI', width=DEFAULT_VIEWPORT_WIDTH, height=DEFAULT_VI
 with dpg.window(tag="left_window", label="Controls", pos=(10, 10), width=390, height=190):
     dpg.add_button(label="Open Folder", tag="open_folder_button", width=-1, callback=folder_picker.show_file_dialog)
     dpg.add_text("None", tag="dir_path_repeat", wrap=360)
+    dpg.add_checkbox(label="Has GFP Channel", tag="has_gfp_channel", default_value=True, callback=gh.gfp_channel_toggle_callback)
     dpg.add_checkbox(label="Save Meta Data", tag="opt_save_metadata", default_value=True)
     dpg.add_checkbox(label="Save Extracted Traces", tag="opt_save_traces", default_value=True)
     dpg.add_checkbox(label="Save Analyzed Data", tag="opt_save_analyzed", default_value=True)    
