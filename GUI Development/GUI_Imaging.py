@@ -13,7 +13,8 @@ from GUI_helpers import (
     update_texture,
     mask_click_callback,
     confirm_mask_selection_callback,
-    save_metadata_callback
+    save_metadata_callback,
+    make_plots_callback
 )
 from analysis_helpers import segment_images, extract_traces
 
@@ -123,6 +124,17 @@ with dpg.window(tag="analysis_panel", label="Analysis Panel", pos=(10, 915), wid
         with dpg.group(horizontal=True):
             dpg.add_button(label="Apply Manual Filter", tag="apply_manual_filter_button", callback=gh.apply_manual_filter, width=150)
             dpg.add_button(label="Reset Manual Filter", tag="reset_manual_filter_button", callback=gh.reset_manual_filter, width=150)
+    dpg.add_spacer(height=8)
+    with dpg.group(tag="plot_options_group"):
+        dpg.add_text("Step 3: Post-Processing Plots", color=(200, 200, 0))
+        with dpg.group(horizontal=True):
+            dpg.add_text("Min Roundness:")
+            dpg.add_input_float(tag="plot_min_roundness", default_value=0.65, width=110, step=0.05, format="%.2f")
+        with dpg.group(horizontal=True):
+            dpg.add_text("Max Diam (um):")
+            dpg.add_input_float(tag="plot_max_diameter_um", default_value=25.0, width=110, step=1.0, format="%.1f")
+        dpg.add_button(label="Make Plots", tag="make_plots_button", width=-1, callback=make_plots_callback)
+        dpg.add_text("Plot Status: Waiting", tag="plot_status_text", wrap=360)
     dpg.add_text("File: None", tag="trace_file_status", wrap=360)
     dpg.add_text("Status: Waiting", tag="trace_status_text", wrap=360)
 

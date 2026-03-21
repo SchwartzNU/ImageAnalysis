@@ -235,6 +235,59 @@ def _clear_segmentation_render_cache():
     segmentation_render_cache_settings = None
     segmentation_base_rgba_cache = None
 
+def make_plots_callback(sender=None, app_data=None, user_data=None):
+    if not current_folder:
+        if dpg.does_item_exist("plot_status_text"):
+            dpg.set_value("plot_status_text", "Plot Status: Open a folder first.")
+        return
+
+    try:
+        import postprocess_plots
+
+        min_roundness = dpg.get_value("plot_min_roundness") if dpg.does_item_exist("plot_min_roundness") else None
+        max_diameter_um = dpg.get_value("plot_max_diameter_um") if dpg.does_item_exist("plot_max_diameter_um") else None
+
+        csv_path, output_dir = postprocess_plots.resolve_inputs(current_folder)
+        df = pd.read_csv(csv_path)
+        filtered_df = postprocess_plots.apply_filters(
+            df,
+            min_roundness=min_roundness,
+            max_diameter_um=max_diameter_um,
+        )
+        postprocess_plots.cleanup_legacy_plot_files(output_dir)
+
+        summaries = []
+        for metric_col, metric_label in postprocess_plots.METRICS:
+            if metric_col not in filtered_df.columns:
+                continue
+            output_path = os.path.join(output_dir, f"{metric_col}.png")
+            summary = postprocess_plots.plot_metric(filtered_df, metric_col, metric_label, output_path)
+            if summary is not None:
+                summaries.append(summary)
+            class_output_path = os.path.join(output_dir, f"{metric_col}_by_soma_size_class.png")
+            class_summary = postprocess_plots.plot_metric_by_soma_size_class(
+                filtered_df,
+                metric_col,
+                metric_label,
+                class_output_path,
+            )
+            if class_summary is not None:
+                summaries.append(class_summary)
+
+        if not summaries:
+            raise RuntimeError("No plots were generated from the current processed CSV.")
+
+        if dpg.does_item_exist("plot_status_text"):
+            dpg.set_value(
+                "plot_status_text",
+                f"Plot Status: Saved {len(summaries)} plot(s) for {len(filtered_df)} filtered rows."
+            )
+        if dpg.does_item_exist("trace_status_text"):
+            dpg.set_value("trace_status_text", f"Status: Saved plots to {output_dir}")
+    except Exception as exc:
+        if dpg.does_item_exist("plot_status_text"):
+            dpg.set_value("plot_status_text", f"Plot Status: Error - {exc}")
+
 def _get_cached_segmentation_render(show_removed, label_filtered_only):
     global segmentation_render_cache, segmentation_render_cache_settings
     if segmentation_masks is None:
