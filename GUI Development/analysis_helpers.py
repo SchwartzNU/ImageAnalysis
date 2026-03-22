@@ -11,12 +11,14 @@ from scipy.ndimage import center_of_mass, sum as nd_sum
 from scipy.stats import skew
 from scipy.signal import find_peaks, peak_widths
 from skimage.measure import label, regionprops
+from skimage.segmentation import expand_labels
 from cellpose import models, denoise
 import GUI_helpers
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 trace_data_df = None
+wga_model_cache = None
 
 def suppress_cellpose_torch_futurewarning():
     # Cellpose currently triggers a torch.load FutureWarning internally when
@@ -29,6 +31,13 @@ def suppress_cellpose_torch_futurewarning():
     )
 
 suppress_cellpose_torch_futurewarning()
+
+def get_wga_model():
+    global wga_model_cache
+    if wga_model_cache is None:
+        model_path_wga = os.path.join(ROOT_DIR, "CP_models", "T5_WGA_V2")
+        wga_model_cache = models.CellposeModel(gpu=True, pretrained_model=model_path_wga)
+    return wga_model_cache
 
 def assign_colors_to_masks(mask_array):
     """
@@ -429,6 +438,64 @@ def get_mask_diameter(mask):
     d = np.max(np.ptp(coords, axis=0))
     return max(5, d)
 
+def get_wga_target_diameter(mask):
+    nucleus_diameter = float(get_mask_diameter(mask))
+    return max(12.0, nucleus_diameter * 1.8)
+
+def build_filtered_label_mask(dapi_masks, filtered_idxs):
+    filtered_idxs = set(int(idx) for idx in filtered_idxs)
+    keep_labels = [int(label_id) for label_id in np.unique(dapi_masks) if label_id > 0 and (int(label_id) - 1) in filtered_idxs]
+    if not keep_labels:
+        return np.zeros_like(dapi_masks, dtype=np.int32)
+    return np.where(np.isin(dapi_masks, keep_labels), dapi_masks, 0).astype(np.int32)
+
+def estimate_gfp_review_expansion(dapi_masks, filtered_idxs):
+    diameters = []
+    filtered_mask = build_filtered_label_mask(dapi_masks, filtered_idxs)
+    for label_id in np.unique(filtered_mask):
+        if label_id <= 0:
+            continue
+        diameters.append(get_mask_diameter(filtered_mask == label_id))
+    if not diameters:
+        return 4
+    median_diameter = float(np.median(diameters))
+    return max(2, min(6, int(round(median_diameter * 0.25))))
+
+def dilate_binary_mask(mask, radius):
+    mask_u8 = mask.astype(np.uint8)
+    if radius <= 0:
+        return mask_u8.astype(bool)
+    kernel_size = 2 * int(radius) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(mask_u8, kernel).astype(bool)
+
+def score_gfp_region(gfp_stack, nucleus_mask):
+    nucleus_mask = nucleus_mask.astype(bool)
+    if not np.any(nucleus_mask):
+        return np.nan
+
+    fg_mask = dilate_binary_mask(nucleus_mask, radius=3)
+    bg_inner = dilate_binary_mask(nucleus_mask, radius=5)
+    bg_outer = dilate_binary_mask(nucleus_mask, radius=11)
+    bg_mask = bg_outer & ~bg_inner
+
+    slice_scores = []
+    for z in range(gfp_stack.shape[0]):
+        plane = gfp_stack[z]
+        fg_vals = plane[fg_mask]
+        if fg_vals.size == 0:
+            continue
+        bg_vals = plane[bg_mask]
+        fg_signal = float(np.percentile(fg_vals, 90.0))
+        bg_signal = float(np.median(bg_vals)) if bg_vals.size else 0.0
+        slice_scores.append(fg_signal - bg_signal)
+
+    if not slice_scores:
+        return np.nan
+    slice_scores = np.asarray(slice_scores, dtype=float)
+    top_n = min(3, slice_scores.size)
+    return float(np.mean(np.sort(slice_scores)[-top_n:]))
+
 def square_mask(mask, perc_increase: int = 40):
     labeled_mask = measure.label(mask)
     regions = measure.regionprops(labeled_mask)
@@ -478,20 +545,7 @@ def square_mask(mask, perc_increase: int = 40):
     return new_mask
 
 def get_sq_stacks(image, single_mask, channel_indices):
-    sq_maski = square_mask(single_mask)
-
-    props = regionprops(sq_maski.astype(int))
-    if not props:
-        min_row, min_col, max_row, max_col = 0, 0, sq_maski.shape[0], sq_maski.shape[1]
-    else:
-        min_row, min_col, max_row, max_col = props[0].bbox
-
-    # Clip to image bounds
-    y_max, x_max = image.shape[2], image.shape[3]
-    min_row = max(0, min_row)
-    min_col = max(0, min_col)
-    max_row = min(y_max, max_row)
-    max_col = min(x_max, max_col)
+    min_row, min_col, max_row, max_col = get_square_mask_bbox(single_mask, image.shape[2], image.shape[3])
 
     sq_stacks = {
         "DAPI": image[:, channel_indices["dapi"], min_row:max_row, min_col:max_col],
@@ -502,6 +556,22 @@ def get_sq_stacks(image, single_mask, channel_indices):
         sq_stacks["eGFP"] = image[:, channel_indices["egfp"], min_row:max_row, min_col:max_col]
 
     return sq_stacks
+
+def get_square_mask_bbox(single_mask, y_max=None, x_max=None):
+    sq_maski = square_mask(single_mask)
+    props = regionprops(sq_maski.astype(int))
+    if not props:
+        min_row, min_col, max_row, max_col = 0, 0, sq_maski.shape[0], sq_maski.shape[1]
+    else:
+        min_row, min_col, max_row, max_col = props[0].bbox
+
+    y_bound = sq_maski.shape[0] if y_max is None else y_max
+    x_bound = sq_maski.shape[1] if x_max is None else x_max
+    min_row = max(0, min_row)
+    min_col = max(0, min_col)
+    max_row = min(y_bound, max_row)
+    max_col = min(x_bound, max_col)
+    return min_row, min_col, max_row, max_col
 
 def nucleus_com(single_channel, mask):
     masked_channel = single_channel * mask
@@ -561,6 +631,36 @@ def extract_square_proj_expand(image, single_mask, channel_indices, extra_pixels
 
     return new_WGA_slice, comzi
 
+def extract_square_proj_expand_from_stacks(DAPI_stack, WGA_stack, single_mask, extra_pixels=50):
+    _, _, comzi = nucleus_com(DAPI_stack, single_mask)
+
+    sq_maski = square_mask(single_mask)
+    props = regionprops(sq_maski.astype(int))
+    if not props:
+        min_row, min_col, max_row, max_col = 0, 0, sq_maski.shape[0], sq_maski.shape[1]
+    else:
+        min_row, min_col, max_row, max_col = props[0].bbox
+
+    y_max, x_max = DAPI_stack.shape[1], DAPI_stack.shape[2]
+    min_row = max(0, min_row)
+    min_col = max(0, min_col)
+    max_row = min(y_max, max_row)
+    max_col = min(x_max, max_col)
+
+    roi_height = max_row - min_row
+    roi_width = max_col - min_col
+    new_height = max(roi_height + 2 * extra_pixels, 1)
+    new_width = max(roi_width + 2 * extra_pixels, 1)
+
+    new_WGA_slice = np.zeros((new_height, new_width), dtype=WGA_stack.dtype)
+    sq_WGA_slice = WGA_stack[comzi, min_row:max_row, min_col:max_col]
+    h_slice = min(roi_height, sq_WGA_slice.shape[0]) if sq_WGA_slice.ndim == 2 else 0
+    w_slice = min(roi_width, sq_WGA_slice.shape[1]) if sq_WGA_slice.ndim == 2 else 0
+    if h_slice > 0 and w_slice > 0:
+        new_WGA_slice[extra_pixels:extra_pixels + h_slice, extra_pixels:extra_pixels + w_slice] = sq_WGA_slice[:h_slice, :w_slice]
+
+    return new_WGA_slice, comzi
+
 def remove_boundary(mask, buffer=50):
     if buffer <= 0:
         return mask
@@ -607,6 +707,68 @@ def get_peak_trace_index(stack, mask):
     if trace.size == 0 or not np.any(np.isfinite(trace)):
         return None
     return int(np.nanargmax(trace))
+
+def default_egfp_threshold(raw_intensities):
+    vals = np.asarray(raw_intensities, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0
+    low = float(np.min(vals))
+    high = float(np.max(vals))
+    if high <= low:
+        return high
+    return low + 0.2 * (high - low)
+
+def prepare_gfp_review_data(file_path, segmentation_file, output_file, dapi_stack=None, wga_stack=None, egfp_stack=None):
+    suppress_cellpose_torch_futurewarning()
+
+    seg_data = np.load(segmentation_file, allow_pickle=True)
+    dapi_masks = seg_data["dapi_masks"]
+    filtered_idxs = set(int(idx) for idx in np.asarray(seg_data["filtered_idxs"]).tolist())
+    z_min = int(seg_data["z_min"])
+    z_max = int(seg_data["z_max"])
+
+    if egfp_stack is not None:
+        gfp_stack = np.asarray(egfp_stack)[z_min:z_max + 1]
+    else:
+        with nd2.ND2File(file_path) as f:
+            stack = to_8bit(f.asarray())
+
+        channel_indices = GUI_helpers.get_image_channel_indices(stack.shape[1])
+        if channel_indices.get("egfp") is None:
+            raise ValueError("Current file does not include a GFP channel.")
+
+        gfp_stack = stack[z_min:z_max + 1, channel_indices["egfp"], :, :]
+
+    gfp_proj = np.max(gfp_stack, axis=0)
+    filtered_label_mask = build_filtered_label_mask(dapi_masks, filtered_idxs)
+    expansion_distance = estimate_gfp_review_expansion(dapi_masks, filtered_idxs)
+    overlay_masks = expand_labels(filtered_label_mask, distance=expansion_distance).astype(np.int32)
+    mask_ids = []
+    egfp_raw_intensities = []
+    mask_labels = np.unique(filtered_label_mask)
+    mask_labels = mask_labels[mask_labels > 0]
+    for label_id in mask_labels:
+        nucleus_mask = filtered_label_mask == int(label_id)
+        if not np.any(nucleus_mask):
+            continue
+        raw_intensity = score_gfp_region(gfp_stack, nucleus_mask)
+        mask_ids.append(int(label_id))
+        egfp_raw_intensities.append(raw_intensity)
+
+    threshold = default_egfp_threshold(egfp_raw_intensities)
+    np.savez(
+        output_file,
+        gfp_proj=gfp_proj,
+        overlay_masks=overlay_masks,
+        mask_ids=np.asarray(mask_ids, dtype=np.int32),
+        egfp_raw_intensities=np.asarray(egfp_raw_intensities, dtype=np.float32),
+        default_threshold=np.float32(threshold),
+        expansion_distance=np.int32(expansion_distance),
+        review_version=np.int32(GUI_helpers.GFP_REVIEW_CACHE_VERSION),
+        filename=os.path.basename(file_path),
+    )
+    return output_file
 
 def nuclei_centers_of_mass(stack, masks):
     ids = np.unique(masks)
@@ -751,6 +913,7 @@ def segment_images():
 
     recompute_existing = dpg.get_value("recompute_segmentation") if dpg.does_item_exist("recompute_segmentation") else False
     dapi_model = None
+    metadata_changed = False
 
     for idx, row in GUI_helpers.metadata_df.iterrows():
         file_timer = time.perf_counter()
@@ -771,6 +934,7 @@ def segment_images():
 
         base_name = os.path.splitext(filename)[0]
         output_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
+        gfp_review_file = os.path.join(segmentation_dir, f"{base_name}_gfp_review.npz")
         if os.path.exists(output_file) and not recompute_existing:
             dpg.set_value("trace_status_text", f"Loaded saved segmentation for {filename}")
             print(f"Using existing segmentation for {filename}: {output_file}")
@@ -784,6 +948,7 @@ def segment_images():
         with nd2.ND2File(file_path) as f:
             stack = to_8bit(f.asarray())
             cropped_stack = stack[z_min:z_max+1]
+        channel_indices = GUI_helpers.get_image_channel_indices(stack.shape[1])
 
         dapi_stack = cropped_stack[:, 0, :, :]
         proj = np.max(dapi_stack, axis=0)
@@ -814,6 +979,18 @@ def segment_images():
                  filename=filename,
                  z_min=z_min,
                  z_max=z_max)
+        if os.path.exists(gfp_review_file):
+            try:
+                os.remove(gfp_review_file)
+            except OSError:
+                pass
+        if channel_indices.get("egfp") is not None:
+            metadata_changed |= GUI_helpers.invalidate_gfp_review_state(
+                filename,
+                remove_cache=False,
+                clear_loaded=(GUI_helpers.opened_file == filename),
+                persist=False,
+            )
         print(f"Saved segmentation to: {output_file} in {time.perf_counter() - step_timer:.2f}s")
 
         # Save a visualization of the segmentation with colors and labels
@@ -826,13 +1003,25 @@ def segment_images():
         print(f"Finished segmentation pipeline for {filename} in {time.perf_counter() - file_timer:.2f}s")
 
     dpg.set_value("trace_file_status", "File: Done with segmentation")
-    dpg.set_value("trace_status_text", f"Status: Segmentation complete. Ready for trace extraction.")
+    if metadata_changed:
+        GUI_helpers._persist_metadata()
+        dpg.set_value("trace_status_text", "Status: Segmentation complete. Review GFP detection for GFP files before trace extraction.")
+    else:
+        dpg.set_value("trace_status_text", "Status: Segmentation complete. Ready for trace extraction.")
     dpg.configure_item("segment_images_button", enabled=True)
     dpg.configure_item("extract_traces_button", enabled=True)
     
     # Auto-load and display the last segmented file
     if GUI_helpers.opened_file:
         GUI_helpers.load_segmentation_if_available(GUI_helpers.opened_file)
+        if GUI_helpers.gfp_channel_exists_for_opened_file():
+            GUI_helpers.load_gfp_review_if_available(GUI_helpers.opened_file)
+        else:
+            GUI_helpers._clear_gfp_review_state()
+            if dpg.does_item_exist("gfp_review_window"):
+                dpg.hide_item("gfp_review_window")
+            GUI_helpers.refresh_gfp_review_controls()
+            GUI_helpers._update_gfp_status()
 
 def extract_traces():
     """
@@ -862,8 +1051,7 @@ def extract_traces():
     small_diameter_filtered = 0
     low_roundness_filtered = 0
 
-    model_path_wga = os.path.join(ROOT_DIR, 'CP_models', 'T5_WGA_V2')
-    wga_model = models.CellposeModel(gpu=True, pretrained_model=model_path_wga)
+    wga_model = get_wga_model()
 
     for idx, row in GUI_helpers.metadata_df.iterrows():
         filename = row.get("filename")
@@ -881,6 +1069,7 @@ def extract_traces():
         # Load segmentation results
         base_name = os.path.splitext(filename)[0]
         seg_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
+        review_file = os.path.join(segmentation_dir, f"{base_name}_gfp_review.npz")
         
         if not os.path.exists(seg_file):
             dpg.set_value("trace_status_text", f"Error: Segmentation not found for {filename}. Run segmentation first.")
@@ -901,6 +1090,24 @@ def extract_traces():
             stack = to_8bit(f.asarray())
         channel_indices = GUI_helpers.get_image_channel_indices(stack.shape[1])
         include_egfp = channel_indices.get("egfp") is not None
+        egfp_threshold = row.get("egfp_threshold", np.nan)
+        egfp_reviewed = row.get("egfp_reviewed", False)
+        review_intensity_by_mask = {}
+        if isinstance(egfp_reviewed, str):
+            egfp_reviewed = egfp_reviewed.strip().lower() in {"1", "true", "yes"}
+        if include_egfp and (not bool(egfp_reviewed) or not np.isfinite(pd.to_numeric(egfp_threshold, errors="coerce"))):
+            dpg.set_value("trace_status_text", f"Error: Review GFP detection for {filename} before extracting traces.")
+            dpg.configure_item("extract_traces_button", enabled=True)
+            return
+        if include_egfp:
+            if not os.path.exists(review_file):
+                dpg.set_value("trace_status_text", f"Error: GFP review data not found for {filename}. Prepare GFP review again.")
+                dpg.configure_item("extract_traces_button", enabled=True)
+                return
+            review_data = np.load(review_file, allow_pickle=True)
+            review_mask_ids = review_data["mask_ids"].astype(int).tolist()
+            review_raw_vals = review_data["egfp_raw_intensities"].astype(float).tolist()
+            review_intensity_by_mask = {int(mask_id): float(raw_val) for mask_id, raw_val in zip(review_mask_ids, review_raw_vals)}
         dapi_stack = stack[z_min:z_max+1, channel_indices["dapi"], :, :]
 
         dpg.set_value("trace_file_status", f"File: {filename}")
@@ -914,8 +1121,10 @@ def extract_traces():
             dpg.set_value("trace_status_text", f"Extracting mask {i} of {len(mask_ids)}")
 
             single_mask = extract_masks(dapi_masks, i, reset_mask_ids=False)
-            diam = get_mask_diameter(single_mask)
+            diam = get_wga_target_diameter(single_mask)
             expansion = 50
+            min_row, min_col, max_row, max_col = get_square_mask_bbox(single_mask, stack.shape[2], stack.shape[3])
+            reference_mask_crop = single_mask[min_row:max_row, min_col:max_col]
 
             sq_stacks = get_sq_stacks(stack, single_mask, channel_indices)
 
@@ -927,7 +1136,7 @@ def extract_traces():
             if len(np.unique(cleaned_mask)) == 1:
                 continue
             elif len(np.unique(cleaned_mask)) > 2:
-                cleaned_mask = closest_mask_2d(single_mask, cleaned_mask)
+                cleaned_mask = closest_mask_2d(reference_mask_crop, cleaned_mask)
 
             file_base = row["filename"] if pd.notnull(row["filename"]) else ""
             cell_data = organize_data(i, z_sep, stack.shape[0], row, file_base, include_egfp=include_egfp)
@@ -961,8 +1170,13 @@ def extract_traces():
                 trace = get_traces(np.expand_dims(sq_stacks[ch_name], axis=0), cleaned_mask)
                 cell_data[f"Y_vals_{ch_name}"] = [trace] * len(cell_data)
                 if ch_name == 'eGFP':
-                    eGFP_sum = np.sum(sq_stacks["eGFP"][z_level][cleaned_mask.astype(bool)])
-                    cell_data['eGFP_Raw_Intensity'] = eGFP_sum / np.sum(cleaned_mask)
+                    egfp_raw_intensity = review_intensity_by_mask.get(int(i) + 1, np.nan)
+                    if not np.isfinite(egfp_raw_intensity):
+                        eGFP_sum = np.sum(sq_stacks["eGFP"][z_level][cleaned_mask.astype(bool)])
+                        egfp_raw_intensity = eGFP_sum / np.sum(cleaned_mask)
+                    cell_data['eGFP_Raw_Intensity'] = egfp_raw_intensity
+                    if np.isfinite(pd.to_numeric(egfp_threshold, errors="coerce")):
+                        cell_data['eGFP_Value'] = bool(egfp_raw_intensity >= float(egfp_threshold))
 
             rip_ids = row.get("rip_cells", [])
             cell_data["in_rip"] = [i in rip_ids]
@@ -973,10 +1187,6 @@ def extract_traces():
 
     if results:
         trace_data_df = pd.concat(results, ignore_index=True)
-        if "eGFP_Raw_Intensity" in trace_data_df.columns:
-            egfp_vals = trace_data_df["eGFP_Raw_Intensity"].values
-            normalized_vals = normalize(egfp_vals)
-            trace_data_df["eGFP_Value"] = normalized_vals > 0.2
 
         # Rename mask_id to Segmentation_Mask_ID to match visualization
         trace_data_df.rename(columns={"mask_id": "Segmentation_Mask_ID"}, inplace=True)

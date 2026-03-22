@@ -16,6 +16,7 @@ from fdialog import FileDialog
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CANVAS_WIDTH = 1024
 CANVAS_HEIGHT = 512
+GFP_REVIEW_CACHE_VERSION = 2
 
 def suppress_cellpose_torch_futurewarning():
     # Cellpose currently triggers a torch.load FutureWarning internally when
@@ -33,6 +34,8 @@ current_folder = None
 opened_file = None
 channel_zstack = None
 channel2_stack = None
+channel_gfp_stack = None
+opened_file_channel_indices = None
 gray_img = None
 mask_array = None
 colors = {}
@@ -48,7 +51,29 @@ segmentation_render_cache = None
 segmentation_render_cache_settings = None
 segmentation_base_rgba_cache = None
 manual_excluded_masks = set()
-METADATA_COLUMNS = ["filename", "z_min", "z_max", "rip_cells", "eye", "time_min", "djid", "treatment", "stain"]
+gfp_review_projection = None
+gfp_review_overlay_masks = None
+gfp_review_intensity_by_mask = {}
+gfp_review_render_regions = []
+gfp_review_segmentation_regions = []
+gfp_review_display_rect = None
+gfp_review_cache_path = None
+gfp_review_filename = None
+gfp_review_source_label = ""
+gfp_review_prepare_hint = ""
+METADATA_COLUMNS = [
+    "filename",
+    "z_min",
+    "z_max",
+    "rip_cells",
+    "eye",
+    "time_min",
+    "djid",
+    "treatment",
+    "stain",
+    "egfp_threshold",
+    "egfp_reviewed",
+]
 metadata_df = pd.DataFrame(columns=METADATA_COLUMNS)
 texture_cache = None
 last_show_masks = True
@@ -80,17 +105,35 @@ def get_image_channel_indices(num_channels):
     raise ValueError(f"Expected at least 3 channels, found {num_channels}")
 
 def gfp_channel_toggle_callback(sender=None, app_data=None, user_data=None):
-    global opened_file
+    global opened_file, opened_file_channel_indices
     if opened_file is None or not dpg.does_item_exist("contents_list"):
         return
 
     current_file = opened_file
-    for display_name, real_name in display_map.items():
-        if real_name == current_file:
-            dpg.set_value("contents_list", display_name)
-            break
+    display_name = _display_name_for_file(current_file)
+    if display_name:
+        dpg.set_value("contents_list", display_name)
     opened_file = None
+    opened_file_channel_indices = None
     open_nd2_callback(sender, app_data, user_data)
+
+def _display_name_for_file(filename):
+    if not filename:
+        return None
+    for display_name, real_name in display_map.items():
+        if real_name == filename:
+            return display_name
+    return filename
+
+def _selected_filename_from_ui(app_data=None):
+    display_name = app_data if isinstance(app_data, str) else None
+    if not display_name and dpg.does_item_exist("contents_list"):
+        value = dpg.get_value("contents_list")
+        if isinstance(value, str):
+            display_name = value
+    if not display_name:
+        return None
+    return display_map.get(display_name, display_name)
 
 def _set_dynamic_texture_from_array(rgba, texture_tag="dynamic_texture"):
     """
@@ -171,6 +214,16 @@ def _normalize_rip_cells(value):
     return []
 
 def _normalize_metadata_record(record):
+    egfp_threshold = record.get("egfp_threshold", np.nan)
+    try:
+        egfp_threshold = float(egfp_threshold)
+    except (TypeError, ValueError):
+        egfp_threshold = np.nan
+
+    egfp_reviewed = record.get("egfp_reviewed", False)
+    if isinstance(egfp_reviewed, str):
+        egfp_reviewed = egfp_reviewed.strip().lower() in {"1", "true", "yes"}
+
     return {
         "filename": str(record.get("filename", "")).strip(),
         "z_min": int(record.get("z_min", 0) or 0),
@@ -181,6 +234,8 @@ def _normalize_metadata_record(record):
         "djid": str(record.get("djid", "") or ""),
         "treatment": str(record.get("treatment", "") or ""),
         "stain": str(record.get("stain", "") or ""),
+        "egfp_threshold": egfp_threshold,
+        "egfp_reviewed": bool(egfp_reviewed),
     }
 
 def _load_metadata_for_folder(folder=None):
@@ -201,7 +256,6 @@ def _load_metadata_for_folder(folder=None):
                     if normalized["filename"]:
                         rows.append(normalized)
         metadata_df = pd.DataFrame(rows, columns=METADATA_COLUMNS) if rows else _empty_metadata_df()
-        print(f"[DEBUG] Loaded {len(metadata_df)} metadata rows from {path}")
     except Exception as exc:
         metadata_df = _empty_metadata_df()
         print(f"[WARN] Failed to load metadata file {path}: {exc}")
@@ -219,21 +273,400 @@ def _persist_metadata():
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=2)
-    print(f"[DEBUG] Saved {len(rows)} metadata rows to {path}")
 
 def _restore_contents_selection():
-    if opened_file is None:
+    if opened_file is None or not dpg.does_item_exist("contents_list"):
         return
-    for display_name, real_name in display_map.items():
-        if real_name == opened_file:
-            dpg.set_value("contents_list", display_name)
-            break
+    display_name = _display_name_for_file(opened_file)
+    if display_name and dpg.get_value("contents_list") != display_name:
+        dpg.set_value("contents_list", display_name)
 
 def _clear_segmentation_render_cache():
     global segmentation_render_cache, segmentation_render_cache_settings, segmentation_base_rgba_cache
     segmentation_render_cache = None
     segmentation_render_cache_settings = None
     segmentation_base_rgba_cache = None
+
+def _clear_gfp_review_state():
+    global gfp_review_projection, gfp_review_overlay_masks, gfp_review_intensity_by_mask
+    global gfp_review_render_regions, gfp_review_segmentation_regions
+    global gfp_review_display_rect, gfp_review_cache_path, gfp_review_filename
+    global gfp_review_source_label, gfp_review_prepare_hint
+    gfp_review_projection = None
+    gfp_review_overlay_masks = None
+    gfp_review_intensity_by_mask = {}
+    gfp_review_render_regions = []
+    gfp_review_segmentation_regions = []
+    gfp_review_display_rect = None
+    gfp_review_cache_path = None
+    gfp_review_filename = None
+    gfp_review_source_label = ""
+    gfp_review_prepare_hint = ""
+
+def _segmentation_file_path(filename):
+    if current_folder is None or not filename:
+        return None
+    folder_name = os.path.basename(current_folder.rstrip("/\\"))
+    segmentation_dir = os.path.join(current_folder, f"{folder_name}_segmentation")
+    base_name = os.path.splitext(filename)[0]
+    return os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
+
+def _gfp_review_file_path(filename):
+    if current_folder is None or not filename:
+        return None
+    folder_name = os.path.basename(current_folder.rstrip("/\\"))
+    segmentation_dir = os.path.join(current_folder, f"{folder_name}_segmentation")
+    base_name = os.path.splitext(filename)[0]
+    return os.path.join(segmentation_dir, f"{base_name}_gfp_review.npz")
+
+def invalidate_gfp_review_state(filename, remove_cache=False, clear_loaded=False, persist=True):
+    global metadata_df
+    if not filename:
+        return False
+
+    changed = False
+    if filename in metadata_df["filename"].values:
+        idx = metadata_df["filename"] == filename
+        current_threshold = pd.to_numeric(metadata_df.loc[idx, "egfp_threshold"], errors="coerce")
+        current_reviewed = metadata_df.loc[idx, "egfp_reviewed"]
+        reviewed_true = current_reviewed.astype(str).str.strip().str.lower().isin({"1", "true", "yes"})
+        if current_threshold.notna().any() or reviewed_true.any():
+            metadata_df.loc[idx, "egfp_threshold"] = np.nan
+            metadata_df.loc[idx, "egfp_reviewed"] = False
+            changed = True
+
+    if remove_cache:
+        review_path = _gfp_review_file_path(filename)
+        if review_path and os.path.exists(review_path):
+            try:
+                os.remove(review_path)
+            except OSError:
+                pass
+
+    if clear_loaded and filename == gfp_review_filename:
+        _clear_gfp_review_state()
+        if dpg.does_item_exist("gfp_review_window"):
+            dpg.hide_item("gfp_review_window")
+
+    if changed and persist:
+        _persist_metadata()
+    refresh_gfp_review_controls()
+    return changed
+
+def gfp_channel_exists_for_opened_file():
+    global opened_file_channel_indices
+    if opened_file is None or current_folder is None:
+        return False
+    if isinstance(opened_file_channel_indices, dict):
+        return opened_file_channel_indices.get("egfp") is not None
+    try:
+        path = os.path.join(current_folder, opened_file)
+        with nd2.ND2File(path) as f:
+            opened_file_channel_indices = get_image_channel_indices(int(f.sizes.get("C", 0)))
+        return opened_file_channel_indices.get("egfp") is not None
+    except Exception:
+        opened_file_channel_indices = None
+        return False
+
+def _configure_gfp_threshold_slider(min_val, max_val, value):
+    if not dpg.does_item_exist("gfp_threshold_slider"):
+        return
+    if not np.isfinite(min_val):
+        min_val = 0.0
+    if not np.isfinite(max_val):
+        max_val = max(min_val + 1.0, 1.0)
+    if max_val <= min_val:
+        max_val = min_val + 1.0
+    value = float(np.clip(value, min_val, max_val))
+    dpg.configure_item("gfp_threshold_slider", min_value=float(min_val), max_value=float(max_val))
+    dpg.set_value("gfp_threshold_slider", value)
+    if dpg.does_item_exist("gfp_threshold_value"):
+        dpg.set_value("gfp_threshold_value", f"Threshold: {value:.2f}")
+
+def refresh_gfp_review_controls():
+    file_loaded = opened_file is not None and current_folder is not None
+    has_gfp = file_loaded and gfp_channel_exists_for_opened_file()
+    segmentation_path = _segmentation_file_path(opened_file) if file_loaded else None
+    has_segmentation = bool(segmentation_path and os.path.exists(segmentation_path))
+    review_loaded = gfp_review_projection is not None and gfp_review_overlay_masks is not None
+
+    if dpg.does_item_exist("prepare_gfp_review_button"):
+        dpg.configure_item("prepare_gfp_review_button", enabled=bool(has_gfp and has_segmentation))
+    if dpg.does_item_exist("accept_gfp_review_button"):
+        dpg.configure_item("accept_gfp_review_button", enabled=bool(review_loaded))
+    if dpg.does_item_exist("gfp_threshold_slider"):
+        dpg.configure_item("gfp_threshold_slider", enabled=bool(review_loaded))
+
+def _update_gfp_status():
+    global gfp_review_source_label, gfp_review_prepare_hint
+    if not dpg.does_item_exist("gfp_status_text"):
+        return
+    if opened_file is None:
+        dpg.set_value("gfp_status_text", "GFP Status: Load a file first.")
+        return
+    if not gfp_channel_exists_for_opened_file():
+        dpg.set_value("gfp_status_text", "GFP Status: Current file does not include a GFP channel.")
+        return
+    if _segmentation_file_path(opened_file) is None or not os.path.exists(_segmentation_file_path(opened_file)):
+        dpg.set_value("gfp_status_text", "GFP Status: Run segmentation first.")
+        return
+    if gfp_review_projection is None or gfp_review_overlay_masks is None:
+        if gfp_review_prepare_hint:
+            dpg.set_value("gfp_status_text", f"GFP Status: {gfp_review_prepare_hint}")
+        else:
+            dpg.set_value("gfp_status_text", "GFP Status: Prepare GFP review for this file.")
+        return
+
+    threshold = dpg.get_value("gfp_threshold_slider") if dpg.does_item_exist("gfp_threshold_slider") else 0.0
+    positive = 0
+    total = 0
+    for mask_id, raw_val in gfp_review_intensity_by_mask.items():
+        total += 1
+        if raw_val >= threshold:
+            positive += 1
+    accepted_suffix = ""
+    if opened_file in metadata_df["filename"].values:
+        row = metadata_df.loc[metadata_df["filename"] == opened_file].iloc[0]
+        reviewed = row.get("egfp_reviewed", False)
+        if isinstance(reviewed, str):
+            reviewed = reviewed.strip().lower() in {"1", "true", "yes"}
+        if bool(reviewed):
+            accepted_suffix = " (accepted)"
+    source_suffix = f" [{gfp_review_source_label}]" if gfp_review_source_label else ""
+    dpg.set_value("gfp_status_text", f"GFP Status: {positive} / {total} cells positive at threshold {float(threshold):.2f}{accepted_suffix}{source_suffix}")
+
+def _rebuild_gfp_review_render_regions():
+    global gfp_review_render_regions
+    gfp_review_render_regions = []
+    if gfp_review_overlay_masks is None:
+        return
+
+    labels = np.unique(gfp_review_overlay_masks)
+    labels = labels[labels > 0]
+    for label in labels:
+        ys, xs = np.where(gfp_review_overlay_masks == label)
+        if ys.size == 0 or xs.size == 0:
+            continue
+        row0, row1 = int(ys.min()), int(ys.max()) + 1
+        col0, col1 = int(xs.min()), int(xs.max()) + 1
+        local_mask = (gfp_review_overlay_masks[row0:row1, col0:col1] == label).astype(np.uint8)
+        contours, _ = cv2.findContours(local_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        gfp_review_render_regions.append({
+            "label": int(label),
+            "row0": row0,
+            "row1": row1,
+            "col0": col0,
+            "col1": col1,
+            "mask": local_mask.astype(bool),
+            "contours": contours,
+        })
+
+def _rebuild_gfp_segmentation_regions():
+    global gfp_review_segmentation_regions
+    gfp_review_segmentation_regions = []
+    if segmentation_masks is None:
+        return
+
+    filtered_set = set(int(idx) for idx in segmentation_filtered_idxs) if segmentation_filtered_idxs is not None else None
+    labels = np.unique(segmentation_masks)
+    labels = labels[labels > 0]
+    for label in labels:
+        if filtered_set is not None and (int(label) - 1) not in filtered_set:
+            continue
+        ys, xs = np.where(segmentation_masks == label)
+        if ys.size == 0 or xs.size == 0:
+            continue
+        row0, row1 = int(ys.min()), int(ys.max()) + 1
+        col0, col1 = int(xs.min()), int(xs.max()) + 1
+        local_mask = (segmentation_masks[row0:row1, col0:col1] == label).astype(np.uint8)
+        contours, _ = cv2.findContours(local_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        gfp_review_segmentation_regions.append({
+            "row0": row0,
+            "row1": row1,
+            "col0": col0,
+            "col1": col1,
+            "contours": contours,
+        })
+
+def display_gfp_review():
+    global gfp_review_display_rect
+    if gfp_review_projection is None or gfp_review_overlay_masks is None:
+        if dpg.does_item_exist("gfp_review_window"):
+            dpg.hide_item("gfp_review_window")
+        return
+
+    base = to_8bit(gfp_review_projection).astype(np.float32) / 255.0
+    rgba = np.zeros((base.shape[0], base.shape[1], 4), dtype=np.float32)
+    rgba[..., :3] = base[..., None]
+    rgba[..., 3] = 1.0
+
+    threshold = dpg.get_value("gfp_threshold_slider") if dpg.does_item_exist("gfp_threshold_slider") else 0.0
+    for region in gfp_review_render_regions:
+        label = region["label"]
+        mask = region["mask"]
+        raw_val = gfp_review_intensity_by_mask.get(label, np.nan)
+        is_positive = np.isfinite(raw_val) and raw_val >= threshold
+        fill_color = np.array([0.10, 0.85, 0.25], dtype=np.float32) if is_positive else np.array([0.85, 0.85, 0.85], dtype=np.float32)
+        alpha = 0.30 if is_positive else 0.08
+        row0, row1 = region["row0"], region["row1"]
+        col0, col1 = region["col0"], region["col1"]
+        patch = rgba[row0:row1, col0:col1]
+        patch[mask, :3] = (1.0 - alpha) * patch[mask, :3] + alpha * fill_color
+
+        outline_rgba = np.zeros_like(patch)
+        outline_color = (0.05, 1.0, 0.2, 1.0) if is_positive else (0.8, 0.2, 0.2, 0.8)
+        for contour in region["contours"]:
+            cv2.polylines(outline_rgba, [contour], isClosed=True, color=outline_color, thickness=1)
+        outline_alpha = outline_rgba[..., 3:4]
+        patch[..., :3] = (1.0 - outline_alpha) * patch[..., :3] + outline_alpha * outline_rgba[..., :3]
+
+    for region in gfp_review_segmentation_regions:
+        row0, row1 = region["row0"], region["row1"]
+        col0, col1 = region["col0"], region["col1"]
+        patch = rgba[row0:row1, col0:col1]
+        outline_rgba = np.zeros_like(patch)
+        for contour in region["contours"]:
+            cv2.polylines(outline_rgba, [contour], isClosed=True, color=(0.0, 1.0, 1.0, 1.0), thickness=2)
+        outline_alpha = outline_rgba[..., 3:4]
+        patch[..., :3] = (1.0 - outline_alpha) * patch[..., :3] + outline_alpha * outline_rgba[..., :3]
+
+    canvas, gfp_review_display_rect = _fit_rgba_to_canvas(rgba)
+    flat = canvas.flatten().tolist()
+    if dpg.does_item_exist("gfp_review_texture"):
+        dpg.set_value("gfp_review_texture", flat)
+    if dpg.does_item_exist("gfp_review_window"):
+        dpg.show_item("gfp_review_window")
+    _update_gfp_status()
+
+def gfp_threshold_slider_callback(sender=None, app_data=None, user_data=None):
+    if dpg.does_item_exist("gfp_threshold_value"):
+        dpg.set_value("gfp_threshold_value", f"Threshold: {float(app_data):.2f}")
+    display_gfp_review()
+
+def load_gfp_review_if_available(filename, source_label="cached"):
+    global gfp_review_projection, gfp_review_overlay_masks, gfp_review_intensity_by_mask
+    global gfp_review_cache_path, gfp_review_filename, gfp_review_source_label, gfp_review_prepare_hint
+    _clear_gfp_review_state()
+
+    if current_folder is None or not filename:
+        refresh_gfp_review_controls()
+        return
+    review_path = _gfp_review_file_path(filename)
+    if review_path is None or not os.path.exists(review_path):
+        if dpg.does_item_exist("gfp_review_window"):
+            dpg.hide_item("gfp_review_window")
+        refresh_gfp_review_controls()
+        _update_gfp_status()
+        return
+
+    review_data = np.load(review_path, allow_pickle=True)
+    review_version = int(review_data["review_version"]) if "review_version" in review_data.files else 0
+    if review_version != GFP_REVIEW_CACHE_VERSION:
+        gfp_review_prepare_hint = f"Cached review is outdated. Press Prepare GFP Review to rebuild it."
+        if dpg.does_item_exist("gfp_review_window"):
+            dpg.hide_item("gfp_review_window")
+        refresh_gfp_review_controls()
+        _update_gfp_status()
+        return
+    gfp_review_projection = review_data["gfp_proj"]
+    gfp_review_overlay_masks = review_data["overlay_masks"]
+    mask_ids = review_data["mask_ids"].astype(int).tolist()
+    raw_vals = review_data["egfp_raw_intensities"].astype(float).tolist()
+    gfp_review_intensity_by_mask = {int(mask_id): float(raw_val) for mask_id, raw_val in zip(mask_ids, raw_vals)}
+    _rebuild_gfp_review_render_regions()
+    gfp_review_cache_path = review_path
+    gfp_review_filename = filename
+    gfp_review_source_label = source_label
+    gfp_review_prepare_hint = ""
+
+    default_threshold = float(review_data["default_threshold"]) if "default_threshold" in review_data.files else 0.0
+    threshold_value = default_threshold
+    if filename in metadata_df["filename"].values:
+        row = metadata_df.loc[metadata_df["filename"] == filename].iloc[0]
+        saved_threshold = pd.to_numeric(row.get("egfp_threshold", np.nan), errors="coerce")
+        if np.isfinite(saved_threshold):
+            threshold_value = float(saved_threshold)
+
+    if raw_vals:
+        slider_min = float(np.min(raw_vals))
+        slider_max = float(np.max(raw_vals))
+    else:
+        slider_min, slider_max = 0.0, 1.0
+    _configure_gfp_threshold_slider(slider_min, slider_max, threshold_value)
+    refresh_gfp_review_controls()
+    display_gfp_review()
+
+def prepare_gfp_review_callback(sender=None, app_data=None, user_data=None):
+    global gfp_review_prepare_hint
+    if opened_file is None or current_folder is None:
+        if dpg.does_item_exist("gfp_status_text"):
+            dpg.set_value("gfp_status_text", "GFP Status: Load a file first.")
+        return
+    if not gfp_channel_exists_for_opened_file():
+        if dpg.does_item_exist("gfp_status_text"):
+            dpg.set_value("gfp_status_text", "GFP Status: Current file does not include a GFP channel.")
+        return
+
+    folder_name = os.path.basename(current_folder.rstrip("/\\"))
+    segmentation_dir = os.path.join(current_folder, f"{folder_name}_segmentation")
+    base_name = os.path.splitext(opened_file)[0]
+    seg_file = os.path.join(segmentation_dir, f"{base_name}_segmentation.npz")
+    if not os.path.exists(seg_file):
+        if dpg.does_item_exist("gfp_status_text"):
+            dpg.set_value("gfp_status_text", "GFP Status: Run segmentation first.")
+        return
+
+    if dpg.does_item_exist("prepare_gfp_review_button"):
+        dpg.configure_item("prepare_gfp_review_button", enabled=False)
+    if dpg.does_item_exist("gfp_status_text"):
+        dpg.set_value("gfp_status_text", "GFP Status: Preparing GFP review...")
+    gfp_review_prepare_hint = ""
+    if dpg.is_dearpygui_running():
+        dpg.split_frame(delay=1)
+
+    try:
+        import analysis_helpers
+        file_path = os.path.join(current_folder, opened_file)
+        review_path = _gfp_review_file_path(opened_file)
+        invalidate_gfp_review_state(opened_file, remove_cache=False, clear_loaded=False, persist=True)
+        analysis_helpers.prepare_gfp_review_data(
+            file_path,
+            seg_file,
+            review_path,
+            dapi_stack=channel_zstack,
+            wga_stack=channel2_stack,
+            egfp_stack=channel_gfp_stack,
+        )
+        load_gfp_review_if_available(opened_file, source_label="prepared now")
+    except Exception as exc:
+        if dpg.does_item_exist("gfp_status_text"):
+            dpg.set_value("gfp_status_text", f"GFP Status: Error - {exc}")
+    finally:
+        if dpg.does_item_exist("prepare_gfp_review_button"):
+            dpg.configure_item("prepare_gfp_review_button", enabled=True)
+        refresh_gfp_review_controls()
+
+def accept_gfp_review_callback(sender=None, app_data=None, user_data=None):
+    global metadata_df
+    if opened_file is None or gfp_review_projection is None:
+        _update_gfp_status()
+        return
+
+    threshold = dpg.get_value("gfp_threshold_slider") if dpg.does_item_exist("gfp_threshold_slider") else np.nan
+    if opened_file in metadata_df["filename"].values:
+        idx = metadata_df["filename"] == opened_file
+        metadata_df.loc[idx, "egfp_threshold"] = float(threshold)
+        metadata_df.loc[idx, "egfp_reviewed"] = True
+    else:
+        metadata_df.loc[len(metadata_df)] = _normalize_metadata_record({
+            "filename": opened_file,
+            "egfp_threshold": float(threshold),
+            "egfp_reviewed": True,
+        })
+    _persist_metadata()
+    refresh_gfp_review_controls()
+    if dpg.does_item_exist("gfp_status_text"):
+        dpg.set_value("gfp_status_text", f"GFP Status: Accepted threshold {float(threshold):.2f}")
 
 def make_plots_callback(sender=None, app_data=None, user_data=None):
     if not current_folder:
@@ -255,24 +688,7 @@ def make_plots_callback(sender=None, app_data=None, user_data=None):
             max_diameter_um=max_diameter_um,
         )
         postprocess_plots.cleanup_legacy_plot_files(output_dir)
-
-        summaries = []
-        for metric_col, metric_label in postprocess_plots.METRICS:
-            if metric_col not in filtered_df.columns:
-                continue
-            output_path = os.path.join(output_dir, f"{metric_col}.png")
-            summary = postprocess_plots.plot_metric(filtered_df, metric_col, metric_label, output_path)
-            if summary is not None:
-                summaries.append(summary)
-            class_output_path = os.path.join(output_dir, f"{metric_col}_by_soma_size_class.png")
-            class_summary = postprocess_plots.plot_metric_by_soma_size_class(
-                filtered_df,
-                metric_col,
-                metric_label,
-                class_output_path,
-            )
-            if class_summary is not None:
-                summaries.append(class_summary)
+        summaries = postprocess_plots.generate_plots(filtered_df, output_dir)
 
         if not summaries:
             raise RuntimeError("No plots were generated from the current processed CSV.")
@@ -388,16 +804,23 @@ def refresh_contents_list(sender=None, app_data=None, user_data=None):
     dpg.configure_item("contents_list", items=display_items)
 
 def handle_folder_selection(folder):
-    global current_folder, opened_file
+    global current_folder, opened_file, channel_zstack, channel2_stack, channel_gfp_stack, opened_file_channel_indices
     current_folder = folder
     opened_file = None
+    channel_zstack = None
+    channel2_stack = None
+    channel_gfp_stack = None
+    opened_file_channel_indices = None
+    _clear_gfp_review_state()
     _load_metadata_for_folder(folder)
     two_level = f"{os.path.basename(os.path.dirname(folder))}/{os.path.basename(folder)}"
     dpg.set_value("dir_path_repeat", two_level)
     refresh_contents_list()
-    for tag in ("z_range_group", "rip_group", "wga_group"):
+    for tag in ("z_range_group", "rip_group", "wga_group", "gfp_review_window"):
         if dpg.does_item_exist(tag):
             dpg.hide_item(tag)
+    refresh_gfp_review_controls()
+    _update_gfp_status()
     dpg.set_value("status_text", "Folder loaded")
 
 def get_folder_picker():
@@ -413,20 +836,27 @@ def get_folder_picker():
     )   
 
 def open_folder_dialog(sender, app_data, user_data):
-    global current_folder, opened_file
+    global current_folder, opened_file, channel_zstack, channel2_stack, channel_gfp_stack, opened_file_channel_indices
     root = tk.Tk(); root.withdraw()
     folder = filedialog.askdirectory(); root.destroy()
     if not folder:
         return
     current_folder = folder
     opened_file = None
+    channel_zstack = None
+    channel2_stack = None
+    channel_gfp_stack = None
+    opened_file_channel_indices = None
+    _clear_gfp_review_state()
     _load_metadata_for_folder(folder)
     two_level = f"{os.path.basename(os.path.dirname(folder))}\\{os.path.basename(folder)}"
     dpg.set_value("dir_path_repeat", two_level)
     refresh_contents_list()
-    for tag in ("z_range_group","rip_group","wga_group"):
+    for tag in ("z_range_group","rip_group","wga_group","gfp_review_window"):
         if dpg.does_item_exist(tag):
             dpg.hide_item(tag)
+    refresh_gfp_review_controls()
+    _update_gfp_status()
     dpg.set_value("status_text", "Folder loaded")
 
 def _delete_segmentation_outputs_for_file(filename):
@@ -513,6 +943,7 @@ def load_segmentation_if_available(filename):
         segmentation_filtered_idxs_original = None
         segmentation_npz_path = None
         manual_excluded_masks.clear()
+    _rebuild_gfp_segmentation_regions()
 
 def display_segmentation_filtered():
     """
@@ -602,7 +1033,10 @@ def segmentation_click_callback(sender, app_data, user_data):
     if new_filtered is not None:
         global segmentation_filtered_idxs
         segmentation_filtered_idxs = new_filtered
+        _rebuild_gfp_segmentation_regions()
     display_segmentation_filtered()
+    if gfp_review_projection is not None and gfp_review_overlay_masks is not None:
+        display_gfp_review()
 
 def apply_manual_filter(sender=None, app_data=None, user_data=None):
     global segmentation_filtered_idxs_original
@@ -617,6 +1051,7 @@ def apply_manual_filter(sender=None, app_data=None, user_data=None):
         payload["filtered_idxs"] = np.array(new_filtered, dtype=int)
         np.savez(segmentation_npz_path, **payload)
         segmentation_filtered_idxs_original = list(new_filtered)
+        _rebuild_gfp_segmentation_regions()
         _clear_segmentation_render_cache()
         if dpg.does_item_exist("status_text"):
             dpg.set_value("status_text", "Manual filter saved to segmentation file")
@@ -629,8 +1064,11 @@ def reset_manual_filter(sender=None, app_data=None, user_data=None):
     if segmentation_filtered_idxs_original is not None:
         global segmentation_filtered_idxs
         segmentation_filtered_idxs = list(segmentation_filtered_idxs_original)
+    _rebuild_gfp_segmentation_regions()
     _clear_segmentation_render_cache()
     display_segmentation_filtered()
+    if gfp_review_projection is not None and gfp_review_overlay_masks is not None:
+        display_gfp_review()
 
 def display_segmentation():
     """
@@ -655,8 +1093,11 @@ def display_segmentation():
         print(f"[ERROR] updating segmentation texture: {e}")
 
 def contents_list_callback(sender, app_data, user_data):
-    display_name = dpg.get_value("contents_list")
-    sel = display_map.get(display_name, display_name)
+    if not dpg.is_dearpygui_running() or not dpg.does_item_exist("status_text"):
+        return
+    sel = _selected_filename_from_ui(app_data)
+    if not sel:
+        return
     if sel != opened_file:
         for tag in ["z_range_group", "z_min_slider", "z_max_slider", "rip_group", "wga_group", "wga_checkbox", "wga_slider", "identifiers_group"]:
             if dpg.does_item_exist(tag):
@@ -670,17 +1111,20 @@ def contents_list_callback(sender, app_data, user_data):
             dpg.show_item("rip_group")
 
 def open_nd2_callback(sender, app_data, user_data):
-    global opened_file, channel_zstack, channel2_stack, gray_img, mask_array, colors, selected_masks, texture_cache
-    display_name = dpg.get_value("contents_list")
-    sel = display_map.get(display_name, display_name)
+    global opened_file, channel_zstack, channel2_stack, channel_gfp_stack, opened_file_channel_indices
+    global gray_img, mask_array, colors, selected_masks, texture_cache
+    sel = _selected_filename_from_ui(app_data)
     if not sel:
-        dpg.set_value("status_text", "No file selected")
+        if dpg.does_item_exist("status_text"):
+            dpg.set_value("status_text", "No file selected")
         return
 
     if sel != opened_file:
         dpg.set_value("status_text", f"Loading: {sel}")
 
         # Reset internal state
+        opened_file_channel_indices = None
+        channel_gfp_stack = None
         mask_array = None
         selected_masks.clear()
         colors.clear()
@@ -692,11 +1136,13 @@ def open_nd2_callback(sender, app_data, user_data):
         with nd2.ND2File(path) as f:
             stack8 = to_8bit(f.asarray())
         channel_indices = get_image_channel_indices(stack8.shape[1])
+        opened_file_channel_indices = dict(channel_indices)
         channel_zstack = stack8[:, channel_indices["dapi"], :, :]
         channel2_stack = stack8[:, channel_indices["wga"], :, :]
+        channel_gfp_stack = stack8[:, channel_indices["egfp"], :, :] if channel_indices.get("egfp") is not None else None
         gray_img = max_proj(channel_zstack)
         opened_file = sel
-        dpg.set_value("contents_list", sel)
+        _restore_contents_selection()
 
         # Auto-fill DJID and Eye based on filename
         digits = ''.join(filter(str.isdigit, sel))
@@ -737,6 +1183,14 @@ def open_nd2_callback(sender, app_data, user_data):
 
         # Load any saved segmentation for this file by default
         load_segmentation_if_available(sel)
+        if channel_indices.get("egfp") is not None:
+            load_gfp_review_if_available(sel)
+        else:
+            _clear_gfp_review_state()
+            if dpg.does_item_exist("gfp_review_window"):
+                dpg.hide_item("gfp_review_window")
+            refresh_gfp_review_controls()
+            _update_gfp_status()
 
         # Rebuild and show UI
         add_z_range_widget("contents_window", channel_zstack.shape[0])
@@ -830,8 +1284,17 @@ def save_metadata_callback(sender, app_data, user_data):
     z0 = dpg.get_value("z_min_slider")
     z1 = dpg.get_value("z_max_slider")
     existing_rip_cells = []
+    existing_egfp_threshold = np.nan
+    existing_egfp_reviewed = False
+    existing_z_min = None
+    existing_z_max = None
     if opened_file in metadata_df["filename"].values:
-        existing_rip_cells = metadata_df.loc[metadata_df["filename"] == opened_file, "rip_cells"].iloc[0]
+        existing_row = metadata_df.loc[metadata_df["filename"] == opened_file].iloc[0]
+        existing_rip_cells = existing_row["rip_cells"]
+        existing_egfp_threshold = existing_row.get("egfp_threshold", np.nan)
+        existing_egfp_reviewed = existing_row.get("egfp_reviewed", False)
+        existing_z_min = int(existing_row.get("z_min", 0))
+        existing_z_max = int(existing_row.get("z_max", 0))
 
     data = {
         "filename": opened_file,
@@ -842,7 +1305,9 @@ def save_metadata_callback(sender, app_data, user_data):
         "time_min": time_min,
         "djid": djid,
         "treatment": treatment,
-        "stain": stain
+        "stain": stain,
+        "egfp_threshold": existing_egfp_threshold,
+        "egfp_reviewed": existing_egfp_reviewed,
     }
 
     if opened_file in metadata_df["filename"].values:
@@ -852,11 +1317,16 @@ def save_metadata_callback(sender, app_data, user_data):
         metadata_df.loc[len(metadata_df)] = data
 
     _persist_metadata()
-    dpg.set_value("status_text", f"Saved metadata for {opened_file}")
     refresh_contents_list()
     _restore_contents_selection()
 
     dpg.show_item("rip_group")
+    z_range_changed = existing_z_min is not None and existing_z_max is not None and (existing_z_min != z0 or existing_z_max != z1)
+    if z_range_changed and gfp_channel_exists_for_opened_file():
+        invalidate_gfp_review_state(opened_file, remove_cache=True, clear_loaded=True, persist=True)
+        dpg.set_value("status_text", f"Saved metadata for {opened_file}. GFP review reset because Z range changed.")
+    else:
+        dpg.set_value("status_text", f"Saved metadata for {opened_file}")
 
 def run_rip_detector_callback(sender, app_data, user_data):
     global metadata_df, mask_array, colors, selected_masks, texture_cache, gray_img
