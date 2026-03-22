@@ -73,7 +73,7 @@ with dpg.texture_registry(show=False):
     _placeholder_gfp = np.zeros((512, 1024, 4), dtype=np.float32).flatten().tolist()
     dpg.add_dynamic_texture(1024, 512, _placeholder_gfp, tag="gfp_review_texture")
 
-dpg.create_viewport(title='GUI', width=DEFAULT_VIEWPORT_WIDTH, height=DEFAULT_VIEWPORT_HEIGHT)
+dpg.create_viewport(title='GCL_analyzer', width=DEFAULT_VIEWPORT_WIDTH, height=DEFAULT_VIEWPORT_HEIGHT)
 
 with dpg.window(tag="left_window", label="Controls", pos=(LEFT_COL_X, TOP_WINDOW_Y), width=LEFT_COL_WIDTH, height=170):
     dpg.add_button(label="Open Folder", tag="open_folder_button", width=-1, callback=folder_picker.show_file_dialog)
