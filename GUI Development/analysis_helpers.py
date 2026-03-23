@@ -557,6 +557,28 @@ def get_sq_stacks(image, single_mask, channel_indices):
 
     return sq_stacks
 
+def get_sq_stacks_from_bbox(image, bbox, channel_indices):
+    min_row, min_col, max_row, max_col = bbox
+    sq_stacks = {
+        "DAPI": image[:, channel_indices["dapi"], min_row:max_row, min_col:max_col],
+        "WGA": image[:, channel_indices["wga"], min_row:max_row, min_col:max_col],
+        "Stain": image[:, channel_indices["stain"], min_row:max_row, min_col:max_col],
+    }
+    if channel_indices.get("egfp") is not None:
+        sq_stacks["eGFP"] = image[:, channel_indices["egfp"], min_row:max_row, min_col:max_col]
+    return sq_stacks
+
+def extract_label_crop(label_image, label_id):
+    ys, xs = np.where(label_image == int(label_id))
+    if ys.size == 0 or xs.size == 0:
+        return None, None
+    min_row = int(ys.min())
+    max_row = int(ys.max()) + 1
+    min_col = int(xs.min())
+    max_col = int(xs.max()) + 1
+    cropped_mask = (label_image[min_row:max_row, min_col:max_col] == int(label_id)).astype(np.uint8)
+    return cropped_mask, (min_row, min_col, max_row, max_col)
+
 def get_square_mask_bbox(single_mask, y_max=None, x_max=None):
     sq_maski = square_mask(single_mask)
     props = regionprops(sq_maski.astype(int))
@@ -896,6 +918,7 @@ def segment_images():
     Step 1: Segment all images and save segmentation results.
     Creates a directory with mask images for each analyzed stack.
     """
+    GUI_helpers.reconcile_metadata_with_folder(persist=True)
     if GUI_helpers.metadata_df.empty:
         dpg.set_value("status_text", "No files are ready for segmentation.")
         return
@@ -1028,6 +1051,7 @@ def extract_traces():
     Step 2: Extract traces from previously segmented images.
     Requires segment_images() to have been run first.
     """
+    GUI_helpers.reconcile_metadata_with_folder(persist=True)
     if GUI_helpers.metadata_df.empty:
         dpg.set_value("status_text", "No files are ready for analysis.")
         return
@@ -1051,7 +1075,7 @@ def extract_traces():
     small_diameter_filtered = 0
     low_roundness_filtered = 0
 
-    wga_model = get_wga_model()
+    wga_model = None
 
     for idx, row in GUI_helpers.metadata_df.iterrows():
         filename = row.get("filename")
@@ -1093,6 +1117,7 @@ def extract_traces():
         egfp_threshold = row.get("egfp_threshold", np.nan)
         egfp_reviewed = row.get("egfp_reviewed", False)
         review_intensity_by_mask = {}
+        review_overlay_masks = None
         if isinstance(egfp_reviewed, str):
             egfp_reviewed = egfp_reviewed.strip().lower() in {"1", "true", "yes"}
         if include_egfp and (not bool(egfp_reviewed) or not np.isfinite(pd.to_numeric(egfp_threshold, errors="coerce"))):
@@ -1108,35 +1133,50 @@ def extract_traces():
             review_mask_ids = review_data["mask_ids"].astype(int).tolist()
             review_raw_vals = review_data["egfp_raw_intensities"].astype(float).tolist()
             review_intensity_by_mask = {int(mask_id): float(raw_val) for mask_id, raw_val in zip(review_mask_ids, review_raw_vals)}
+            if "overlay_masks" in review_data:
+                review_overlay_masks = review_data["overlay_masks"].astype(np.int32)
         dapi_stack = stack[z_min:z_max+1, channel_indices["dapi"], :, :]
 
         dpg.set_value("trace_file_status", f"File: {filename}")
 
         mask_ids = np.delete(np.unique(dapi_masks), 0) - 1
 
-        for i in mask_ids:
+        filtered_mask_ids = [int(i) for i in mask_ids if int(i) in filtered_idxs]
+        total_filtered_masks = len(filtered_mask_ids)
+        for mask_counter, i in enumerate(filtered_mask_ids, start=1):
             if i not in filtered_idxs:
                 continue
 
-            dpg.set_value("trace_status_text", f"Extracting mask {i} of {len(mask_ids)}")
+            if mask_counter == 1 or mask_counter == total_filtered_masks or (mask_counter % 10) == 0:
+                dpg.set_value("trace_status_text", f"Extracting cell {mask_counter} of {total_filtered_masks}")
 
-            single_mask = extract_masks(dapi_masks, i, reset_mask_ids=False)
-            diam = get_wga_target_diameter(single_mask)
-            expansion = 50
-            min_row, min_col, max_row, max_col = get_square_mask_bbox(single_mask, stack.shape[2], stack.shape[3])
-            reference_mask_crop = single_mask[min_row:max_row, min_col:max_col]
+            label_id = int(i) + 1
+            cleaned_mask = None
+            sq_stacks = None
+            z_level = None
 
-            sq_stacks = get_sq_stacks(stack, single_mask, channel_indices)
+            if review_overlay_masks is not None:
+                cleaned_mask, bbox = extract_label_crop(review_overlay_masks, label_id)
+                if cleaned_mask is not None and bbox is not None and np.any(cleaned_mask):
+                    sq_stacks = get_sq_stacks_from_bbox(stack, bbox, channel_indices)
 
-            expanded_sq, z_level = extract_square_proj_expand(stack, single_mask, channel_indices, expansion)
+            if cleaned_mask is None or sq_stacks is None:
+                single_mask = extract_masks(dapi_masks, i, reset_mask_ids=False)
+                diam = get_wga_target_diameter(single_mask)
+                expansion = 50
+                min_row, min_col, max_row, max_col = get_square_mask_bbox(single_mask, stack.shape[2], stack.shape[3])
+                reference_mask_crop = single_mask[min_row:max_row, min_col:max_col]
+                sq_stacks = get_sq_stacks(stack, single_mask, channel_indices)
+                expanded_sq, z_level = extract_square_proj_expand(stack, single_mask, channel_indices, expansion)
+                if wga_model is None:
+                    wga_model = get_wga_model()
+                expanded_mask, _, _ = wga_model.eval(expanded_sq, diameter=diam, channels=[0, 0])
+                cleaned_mask = remove_boundary(expanded_mask, expansion)
 
-            expanded_mask, _, _ = wga_model.eval(expanded_sq, diameter=diam, channels=[0, 0])
-            cleaned_mask = remove_boundary(expanded_mask, expansion)
-
-            if len(np.unique(cleaned_mask)) == 1:
-                continue
-            elif len(np.unique(cleaned_mask)) > 2:
-                cleaned_mask = closest_mask_2d(reference_mask_crop, cleaned_mask)
+                if len(np.unique(cleaned_mask)) == 1:
+                    continue
+                elif len(np.unique(cleaned_mask)) > 2:
+                    cleaned_mask = closest_mask_2d(reference_mask_crop, cleaned_mask)
 
             file_base = row["filename"] if pd.notnull(row["filename"]) else ""
             cell_data = organize_data(i, z_sep, stack.shape[0], row, file_base, include_egfp=include_egfp)
@@ -1172,6 +1212,10 @@ def extract_traces():
                 if ch_name == 'eGFP':
                     egfp_raw_intensity = review_intensity_by_mask.get(int(i) + 1, np.nan)
                     if not np.isfinite(egfp_raw_intensity):
+                        if z_level is None:
+                            z_level = get_peak_trace_index(sq_stacks["eGFP"], cleaned_mask)
+                            if z_level is None:
+                                z_level = 0
                         eGFP_sum = np.sum(sq_stacks["eGFP"][z_level][cleaned_mask.astype(bool)])
                         egfp_raw_intensity = eGFP_sum / np.sum(cleaned_mask)
                     cell_data['eGFP_Raw_Intensity'] = egfp_raw_intensity

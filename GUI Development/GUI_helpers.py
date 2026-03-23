@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import warnings
 import numpy as np
 import pandas as pd
@@ -238,6 +239,82 @@ def _normalize_metadata_record(record):
         "egfp_reviewed": bool(egfp_reviewed),
     }
 
+def _list_nd2_files(folder=None):
+    folder = folder or current_folder
+    if not folder or not os.path.isdir(folder):
+        return []
+    return sorted(
+        f for f in os.listdir(folder)
+        if isinstance(f, str) and f.lower().endswith(".nd2")
+    )
+
+def _metadata_filename_key(filename):
+    stem = os.path.splitext(os.path.basename(str(filename or "")))[0].strip().lower()
+    return re.sub(r"_v\d+$", "", stem)
+
+def reconcile_metadata_with_folder(folder=None, persist=False):
+    global metadata_df
+    folder = folder or current_folder
+    actual_files = _list_nd2_files(folder)
+    actual_lookup = {name.lower(): name for name in actual_files}
+    file_order = {name.lower(): idx for idx, name in enumerate(actual_files)}
+
+    rows = []
+    for record in metadata_df.to_dict(orient="records"):
+        normalized = _normalize_metadata_record(record)
+        if normalized["filename"]:
+            rows.append(normalized)
+
+    reconciled = []
+    used_actual = set()
+    unmatched_rows = []
+    changed = False
+
+    for record in rows:
+        actual_name = actual_lookup.get(record["filename"].lower())
+        if actual_name is None:
+            unmatched_rows.append(record)
+            changed = True
+            continue
+        actual_key = actual_name.lower()
+        if actual_key in used_actual:
+            changed = True
+            continue
+        normalized = dict(record)
+        if normalized["filename"] != actual_name:
+            normalized["filename"] = actual_name
+            changed = True
+        reconciled.append(normalized)
+        used_actual.add(actual_key)
+
+    for actual_name in actual_files:
+        actual_key = actual_name.lower()
+        if actual_key in used_actual:
+            continue
+        match_idx = next(
+            (
+                idx for idx, record in enumerate(unmatched_rows)
+                if _metadata_filename_key(record["filename"]) == _metadata_filename_key(actual_name)
+            ),
+            None,
+        )
+        if match_idx is None:
+            continue
+        normalized = dict(unmatched_rows.pop(match_idx))
+        if normalized["filename"] != actual_name:
+            normalized["filename"] = actual_name
+            changed = True
+        reconciled.append(_normalize_metadata_record(normalized))
+        used_actual.add(actual_key)
+
+    reconciled.sort(key=lambda record: file_order.get(record["filename"].lower(), len(file_order)))
+    metadata_df = pd.DataFrame(reconciled, columns=METADATA_COLUMNS) if reconciled else _empty_metadata_df()
+
+    if persist and folder:
+        _persist_metadata()
+
+    return changed
+
 def _load_metadata_for_folder(folder=None):
     global metadata_df
     path = _metadata_file_path(folder)
@@ -256,6 +333,7 @@ def _load_metadata_for_folder(folder=None):
                     if normalized["filename"]:
                         rows.append(normalized)
         metadata_df = pd.DataFrame(rows, columns=METADATA_COLUMNS) if rows else _empty_metadata_df()
+        reconcile_metadata_with_folder(folder, persist=bool(rows))
     except Exception as exc:
         metadata_df = _empty_metadata_df()
         print(f"[WARN] Failed to load metadata file {path}: {exc}")

@@ -60,7 +60,6 @@ def load_combined_data(root):
             df["Experimental_Condition"] = df["Metadata_Treatment"].fillna(df["Experimental_Condition"])
 
         df["animal_id"] = folder.name
-        df["Light_Dark_Condition"] = df["Experimental_Condition"].map({"dark": "dark", "open": "light"})
         rows.append(df)
 
     if not rows:
@@ -69,6 +68,14 @@ def load_combined_data(root):
     combined = pd.concat(rows, ignore_index=True)
     combined[TARGET_METRIC] = pd.to_numeric(combined[TARGET_METRIC], errors="coerce")
     combined = combined.dropna(subset=[TARGET_METRIC, "Stain"])
+    combined["Merged_Condition"] = combined["Experimental_Condition"].map(
+        {
+            "sutured": "sutured",
+            "dark": "sutured",
+            "open": "open",
+            "light": "open",
+        }
+    )
     return combined
 
 
@@ -164,25 +171,7 @@ def plot_two_panel_comparison(summary_df, condition_column, condition_order, tit
             (summary_df["Stain"] == stain) & (summary_df[condition_column].isin(condition_order))
         ].copy()
         x_positions = np.arange(len(condition_order))
-
-        # Connect matched animal summaries across the two conditions when both exist.
-        paired = stain_df.pivot_table(
-            index="animal_id",
-            columns=condition_column,
-            values="Animal_Top_Surface_Ratio_Median",
-            aggfunc="first",
-        )
-        if all(cond in paired.columns for cond in condition_order):
-            paired = paired.dropna(subset=condition_order)
-            for _, pair_row in paired.iterrows():
-                ax.plot(
-                    x_positions,
-                    [float(pair_row[condition_order[0]]), float(pair_row[condition_order[1]])],
-                    color="#7F8C8D",
-                    alpha=0.45,
-                    linewidth=1.2,
-                    zorder=1,
-                )
+        point_positions = {}
 
         for idx, condition in enumerate(condition_order):
             cond_df = stain_df.loc[stain_df[condition_column] == condition]
@@ -191,8 +180,11 @@ def plot_two_panel_comparison(summary_df, condition_column, condition_order, tit
             any_data = True
             values = cond_df["Animal_Top_Surface_Ratio_Median"].to_numpy(dtype=float)
             jitter = rng.uniform(-0.08, 0.08, size=len(values))
+            x_vals = np.full(len(values), x_positions[idx]) + jitter
+            for animal_id, x_val, y_val in zip(cond_df["animal_id"], x_vals, values):
+                point_positions[(animal_id, condition)] = (float(x_val), float(y_val))
             ax.scatter(
-                np.full(len(values), x_positions[idx]) + jitter,
+                x_vals,
                 values,
                 s=40,
                 alpha=0.75,
@@ -201,6 +193,17 @@ def plot_two_panel_comparison(summary_df, condition_column, condition_order, tit
                 linewidths=0.5,
                 zorder=3,
             )
+            for animal_id, x_val, y_val in zip(cond_df["animal_id"], x_vals, values):
+                ax.annotate(
+                    str(animal_id),
+                    (float(x_val), float(y_val)),
+                    xytext=(4, 2),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color="#22313F",
+                    alpha=0.85,
+                    zorder=4,
+                )
 
             median_val = float(np.median(values))
             std_val = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
@@ -225,6 +228,21 @@ def plot_two_panel_comparison(summary_df, condition_column, condition_order, tit
                 va="bottom",
                 fontsize=9,
                 color="#22313F",
+            )
+
+        # Connect matched animal summaries across the two conditions using the
+        # exact scatter-point positions so the line lands on the points.
+        for animal_id in stain_df["animal_id"].dropna().unique():
+            pair = [point_positions.get((animal_id, condition)) for condition in condition_order]
+            if any(point is None for point in pair):
+                continue
+            ax.plot(
+                [pair[0][0], pair[1][0]],
+                [pair[0][1], pair[1][1]],
+                color="#7F8C8D",
+                alpha=0.45,
+                linewidth=1.2,
+                zorder=1,
             )
 
         ax.set_xticks(x_positions)
@@ -264,48 +282,25 @@ def main():
 
     combined_df = load_combined_data(root)
 
-    open_sutured_summary = summarize_by_animal(combined_df, "Experimental_Condition")
-    open_sutured_summary = open_sutured_summary.loc[
-        open_sutured_summary["Experimental_Condition"].isin(["open", "sutured"])
+    summary_df = summarize_by_animal(combined_df, "Merged_Condition")
+    summary_df = summary_df.loc[
+        summary_df["Merged_Condition"].isin(["sutured", "open"])
     ].copy()
-    open_sutured_summary["Comparison_Type"] = "open_vs_sutured"
-    open_sutured_summary = open_sutured_summary.rename(
-        columns={"Experimental_Condition": "Comparison_Condition"}
-    )
-
-    dark_light_summary = summarize_by_animal(combined_df, "Light_Dark_Condition")
-    dark_light_summary = dark_light_summary.loc[
-        dark_light_summary["Light_Dark_Condition"].isin(["dark", "light"])
-    ].copy()
-    dark_light_summary["Comparison_Type"] = "dark_vs_light"
-    dark_light_summary = dark_light_summary.rename(
-        columns={"Light_Dark_Condition": "Comparison_Condition"}
-    )
-
-    summary_df = pd.concat([open_sutured_summary, dark_light_summary], ignore_index=True)
+    summary_df["Comparison_Type"] = "merged_open_vs_sutured"
+    summary_df = summary_df.rename(columns={"Merged_Condition": "Comparison_Condition"})
     summary_csv = output_dir / "top_surface_ratio_animal_level_summary.csv"
     summary_df.to_csv(summary_csv, index=False)
     print(f"Saved summary CSV: {summary_csv}")
 
-    open_sutured_plot = plot_two_panel_comparison(
-        open_sutured_summary.rename(columns={"Comparison_Condition": "Comparison_Condition"}),
+    merged_plot = plot_two_panel_comparison(
+        summary_df,
         "Comparison_Condition",
         ["sutured", "open"],
-        "Top Surface Ratio Across Animals: Sutured vs Open",
+        "Top Surface Ratio Across Animals: Sutured/Open and Dark/Light Collapsed",
         output_dir / "top_surface_ratio_open_vs_sutured.png",
     )
-    if open_sutured_plot:
-        print(f"Saved plot: {open_sutured_plot}")
-
-    dark_light_plot = plot_two_panel_comparison(
-        dark_light_summary.rename(columns={"Comparison_Condition": "Comparison_Condition"}),
-        "Comparison_Condition",
-        ["dark", "light"],
-        "Top Surface Ratio Across Animals: Dark vs Light",
-        output_dir / "top_surface_ratio_dark_vs_light.png",
-    )
-    if dark_light_plot:
-        print(f"Saved plot: {dark_light_plot}")
+    if merged_plot:
+        print(f"Saved plot: {merged_plot}")
 
 
 if __name__ == "__main__":
